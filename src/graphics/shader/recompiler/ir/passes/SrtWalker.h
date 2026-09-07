@@ -11,6 +11,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryBlockReader =
+    bool (*)(void* userdata, uint64_t address, uint32_t* words, uint32_t word_count);
 using SrtMemorySync   = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
@@ -19,6 +21,7 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	SrtMemoryBlockReader      read_specialization_block  = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
 };
 

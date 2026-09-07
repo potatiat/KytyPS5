@@ -106,6 +106,12 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
+bool ReadShaderGuestMemoryBlock(void*, uint64_t address, uint32_t* words, uint32_t word_count) {
+	return words != nullptr && word_count != 0 &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+	           address, words, uint64_t {word_count} * sizeof(uint32_t));
+}
+
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
@@ -325,6 +331,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;

@@ -252,6 +252,14 @@ void MakeRangeReadable(const SrtRuntime& runtime, uint64_t base, uint64_t size) 
 	}
 }
 
+bool TryReadSpecializationBlock(const SrtRuntime& runtime, uint64_t address, uint32_t* words,
+                                uint32_t count) {
+	return runtime.read_specialization_memory != nullptr &&
+	       runtime.read_specialization_block != nullptr && count != 0 && address <= AddressMask &&
+	       uint64_t {count} * sizeof(uint32_t) - 1 <= AddressMask - address &&
+	       runtime.read_specialization_block(runtime.userdata, address, words, count);
+}
+
 bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynamic_offset,
                           uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
 	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
@@ -532,7 +540,17 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		DescriptorValue candidate;
 		candidate.dword_count  = 8u;
 		const auto heap_offset = key << 5u;
-		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+		const auto heap_size = ScalarBufferSize(heap);
+		const auto heap_base = heap.Base48() & ~uint64_t {3};
+		const bool full_entry = heap_offset <= heap_size &&
+		                        heap_size - heap_offset >=
+		                            candidate.dword_count * sizeof(uint32_t) &&
+		                        heap_offset <= AddressMask - heap_base;
+		const bool block_read =
+		    full_entry && TryReadSpecializationBlock(runtime, heap_base + heap_offset,
+		                                             candidate.dwords.data(),
+		                                             candidate.dword_count);
+		for (uint32_t dword = 0; !block_read && dword < candidate.dword_count; dword++) {
 			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
 			                          candidate.dwords[dword])) {
 				return note("heap entry is not readable");
