@@ -82,6 +82,18 @@ struct ImageInfo {
 	[[nodiscard]] constexpr bool IsVolume() const noexcept {
 		return type == Prospero::ImageType::kColor3D;
 	}
+	[[nodiscard]] constexpr bool Is1D() const noexcept {
+		return type == Prospero::ImageType::kColor1D || type == Prospero::ImageType::kColor1DArray;
+	}
+	[[nodiscard]] constexpr vk::ImageType HostImageType() const noexcept {
+		if (IsVolume()) {
+			return vk::ImageType::e3D;
+		}
+		if (Is1D()) {
+			return vk::ImageType::e1D;
+		}
+		return vk::ImageType::e2D;
+	}
 	[[nodiscard]] constexpr bool IsLayered() const noexcept {
 		return !IsVolume() && resources.layers > 1;
 	}
@@ -532,6 +544,15 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 
 [[nodiscard]] inline bool ImagePageRangesOverlap(GuestRange left, GuestRange right) {
 	return ImagePageRangesOverlap(left.address, left.size, right.address, right.size);
+}
+
+[[nodiscard]] constexpr vk::ImageType HostImageType(Prospero::ImageType type) noexcept {
+	switch (type) {
+		case Prospero::ImageType::kColor1D:
+		case Prospero::ImageType::kColor1DArray: return vk::ImageType::e1D;
+		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
+		default: return vk::ImageType::e2D;
+	}
 }
 
 } // namespace Libs::Graphics

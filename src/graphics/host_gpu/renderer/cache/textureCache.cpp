@@ -224,8 +224,13 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.tile_mode != requested.tile_mode) {
 		return false;
 	}
-	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format)) {
+		return false;
+	}
+	if (HostImageType(cached.type) != HostImageType(requested.type)) {
+		return false;
+	}
+	if (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1}) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -527,23 +532,27 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	const auto     format = desc.info.pixel_format;
+	const auto     type   = desc.info.type;
+	const uint64_t key    = (static_cast<uint64_t>(format) << 32) |
+	                        (static_cast<uint64_t>(desc.info.samples) << 16) |
+	                        static_cast<uint32_t>(type);
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
-	info.samples         = 1;
+	info.samples         = desc.info.samples;
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(key, id);
 	return id;
 }
 
@@ -855,6 +864,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
 
 	if (requested.data.address == cached.info.data.address) {
+		if (HostImageType(cached.info.type) != HostImageType(requested.type)) {
+			if (requested.data.size == cached.info.data.size &&
+			    (requested.IsVolume() || cached.info.IsVolume())) {
+				return {ExpandImage(requested, cached_id)};
+			}
+			if (safe_to_delete) {
+				FreeImage(cached_id);
+			}
+			return {merged_id};
+		}
+
 		const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 		const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 		if (requested.BlockExtent() != cached.info.BlockExtent() ||
@@ -1489,35 +1509,59 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
-	TouchImage(image);
-	if (!image.info.data.Empty()) {
-		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+	auto*            image = m_slot_images.try_get(id);
+	if (image != nullptr && image->depth_id) {
+		id    = image->depth_id;
+		image = m_slot_images.try_get(id);
+	}
+	if (image == nullptr) {
+		return nullptr;
+	}
+	TouchImage(*image);
+	if (!image->info.data.Empty()) {
+		if (!image->registered || image->binding.needs_rebind) {
+			const auto candidates =
+			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto candidate_id: candidates) {
+				auto* candidate = m_slot_images.try_get(candidate_id);
+				if (candidate != nullptr && candidate->registered && !candidate->depth_id &&
+				    candidate->info.data.address == desc.info.data.address) {
+					id    = candidate_id;
+					image = candidate;
+					break;
+				}
+			}
+			image->binding.needs_rebind = false;
 		}
 	}
 	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
+		image->MarkGpuModified();
 	}
-	if (!image.info.data.Empty()) {
+	if (!image->info.data.Empty()) {
 		PrepareDccClear(id, desc);
 		RefreshImage(id);
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			if (!image.info.data.Empty()) {
-				if (!image.registered || image.depth_id) {
-					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
+			if (!image->info.data.Empty()) {
+				if (image->depth_id) {
+					id    = image->depth_id;
+					image = m_slot_images.try_get(id);
 				}
-				CommitGpuWrite(image);
+				if (image != nullptr) {
+					CommitGpuWrite(*image);
+					TrackImageDownload(id, *image);
+				}
 			}
-			TrackImageDownload(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
+	if (image == nullptr) {
+		return nullptr;
+	}
+	const auto view = image->FindView(desc.view_info);
+	NameImageBinding(m_graphics, *image, view, desc.type, desc.view_info);
 	return view;
 }
 
@@ -1526,19 +1570,37 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+	auto*            image = m_slot_images.try_get(id);
+	if (image != nullptr && image->depth_id) {
+		id    = image->depth_id;
+		image = m_slot_images.try_get(id);
 	}
-	TouchImage(image);
-	image.MarkGpuModified();
-	image.usage.render_target = true;
+	if (image == nullptr) {
+		return nullptr;
+	}
+	if (!image->registered || image->binding.needs_rebind) {
+		const auto candidates =
+		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		for (const auto candidate_id: candidates) {
+			auto* candidate = m_slot_images.try_get(candidate_id);
+			if (candidate != nullptr && candidate->registered && !candidate->depth_id &&
+			    candidate->info.data.address == desc.info.data.address) {
+				id    = candidate_id;
+				image = candidate;
+				break;
+			}
+		}
+		image->binding.needs_rebind = false;
+	}
+	TouchImage(*image);
+	image->MarkGpuModified();
+	image->usage.render_target = true;
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
-	CommitGpuWrite(image);
-	TrackImageDownload(id, image);
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
+	CommitGpuWrite(*image);
+	TrackImageDownload(id, *image);
+	const auto view = image->FindView(desc.view_info);
+	NameImageBinding(m_graphics, *image, view, desc.type, desc.view_info);
 	return view;
 }
 
@@ -1547,33 +1609,51 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	auto*            image = m_slot_images.try_get(id);
+	if (image != nullptr && image->depth_id) {
+		id    = image->depth_id;
+		image = m_slot_images.try_get(id);
 	}
-	TouchImage(image);
-	image.MarkGpuModified();
-	image.usage.depth_target = true;
+	if (image == nullptr) {
+		return nullptr;
+	}
+	if (!image->registered || image->binding.needs_rebind) {
+		const auto candidates =
+		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		for (const auto candidate_id: candidates) {
+			auto* candidate = m_slot_images.try_get(candidate_id);
+			if (candidate != nullptr && candidate->registered && !candidate->depth_id &&
+			    candidate->info.data.address == desc.info.data.address) {
+				id    = candidate_id;
+				image = candidate;
+				break;
+			}
+		}
+		image->binding.needs_rebind = false;
+	}
+	TouchImage(*image);
+	image->MarkGpuModified();
+	image->usage.depth_target = true;
 	RefreshImage(id);
 	if (desc.info.HasMetadata()) {
-		image.info.metadata = desc.info.metadata;
+		image->info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                              .clear_mask = image.info.htile_clear_mask});
+		                                              .clear_mask = image->info.htile_clear_mask});
 		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
 			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
 			// The depth binding defines the new type; incompatible fill state cannot carry over.
 			metadata->second = {.type       = MetaDataInfo::Type::HTile,
-			                    .clear_mask = image.info.htile_clear_mask};
+			                    .clear_mask = image->info.htile_clear_mask};
 		}
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(*image);
 	if (desc.info.HasStencil()) {
 		AssociateStencil(id, desc.info.stencil);
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
+	const auto view = image->FindView(desc.view_info);
+	NameImageBinding(m_graphics, *image, view, desc.type, desc.view_info);
 	return view;
 }
 
@@ -1968,6 +2048,22 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return false;
+	}
+	bool has_images = false;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners != nullptr && !owners->empty()) {
+			has_images = true;
+			break;
+		}
+	}
+	if (!has_images) {
+		return false;
+	}
+
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
