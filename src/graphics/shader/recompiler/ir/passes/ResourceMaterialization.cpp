@@ -47,12 +47,20 @@ bool SpecializationFail(MaterializeReport* report, std::string_view message) {
 }
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
-                                            Decoder::ImageDimension requested) {
+                                            Decoder::ImageDimension requested,
+                                            ImageResourceClass      resource_class) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
+	// GCN ignores the slice on a non-array texture sampled with an array opcode.
+	// Promote those descriptors for sampled images so a mixed dense table keeps
+	// them as 1-layer array views. Storage UAVs must keep the guest type: the
+	// host storage path rejects a 2D descriptor bound as a 2D-array.
+	const bool promote_array = is_array && resource_class == ImageResourceClass::Sampled;
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
-		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
+		case Prospero::ImageType::kColor1D:
+			return promote_array ? Decoder::ImageDimension::Dim1DArray
+			                     : Decoder::ImageDimension::Dim1D;
 		case Prospero::ImageType::kColor1DArray:
 			if (is_array) {
 				return Decoder::ImageDimension::Dim1DArray;
@@ -70,8 +78,12 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 				return Decoder::ImageDimension::Dim2DMsaaArray;
 			}
 			return Decoder::ImageDimension::Dim2DMsaa;
-		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2D:
+			return promote_array ? Decoder::ImageDimension::Dim2DArray
+			                     : Decoder::ImageDimension::Dim2D;
+		case Prospero::ImageType::kColor2DMsaa:
+			return promote_array ? Decoder::ImageDimension::Dim2DMsaaArray
+			                     : Decoder::ImageDimension::Dim2DMsaa;
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }
@@ -164,7 +176,7 @@ struct IndirectImageClass {
 IndirectImageClass DescriptorClass(const ImageResource& image, const DescriptorValue& descriptor) {
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	IndirectImageClass result;
-	result.dimension  = DescriptorDimension(descriptor, image.dimension);
+	result.dimension  = DescriptorDimension(descriptor, image.dimension, image.resource_class);
 	result.conversion = ImageConversionFormat(format);
 	result.swizzle    = result.conversion == Prospero::BufferFormat::kInvalid
 	                        ? 0u
@@ -824,7 +836,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			image.cube          = false;
 			continue;
 		}
-		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
+		const auto descriptor_dimension =
+		    DescriptorDimension(descriptor, base.dimension, base.resource_class);
 		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
 			return SpecializationFail(report, fmt::format(
 			    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"

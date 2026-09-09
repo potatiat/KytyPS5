@@ -3,8 +3,10 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -170,6 +172,12 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		std::ofstream dump("logs/shader-fail.ir.txt", std::ios::out | std::ios::trunc);
+		if (dump) {
+			dump << message << "\nwaterfalls="
+			     << FindWaterfallDescriptors(m_program).size() << "\n\n"
+			     << ProgramToString(m_program);
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -400,6 +408,10 @@ private:
 	}
 
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		auto reject = [&](const char* why) {
+			m_indirect_reason = why;
+			return false;
+		};
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -410,24 +422,24 @@ private:
 		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
 			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
 			if (heap_reads[dword] == nullptr) {
-				return false;
+				return reject("image dword is not an instruction");
 			}
 			uint32_t    memory_index = 0;
 			const auto* memory       = ScalarReadMemory(*heap_reads[dword], memory_index);
 			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t) ||
 			    !MemoryIndexBelongsTo(memory_index, *heap_reads[dword])) {
-				return false;
+				return reject("image dword is not a scalar-buffer heap read");
 			}
 			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
 			if (current_handle == nullptr ||
 			    (heap_handle != nullptr && current_handle != heap_handle)) {
-				return false;
+				return reject("image dwords do not share one heap buffer");
 			}
 			heap_handle = current_handle;
 			if (dword == 0u) {
 				heap_offset = heap_reads[dword]->Arg(1).Resolve();
 			} else if (!EquivalentValue(m_program, heap_offset, heap_reads[dword]->Arg(1))) {
-				return false;
+				return reject("image dwords do not share one heap offset");
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword]  = heap_reads[dword];
@@ -438,21 +450,22 @@ private:
 		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
 		    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), shift_amount) ||
 		    shift_amount != 5u) {
-			return false;
+			return reject("heap offset is not shift-left 5");
 		}
 		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
 		if (material_read == nullptr) {
-			return false;
+			return reject("material key is not an instruction");
 		}
 		uint32_t    material_memory_index = 0;
 		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
-		if (material_memory == nullptr || material_memory->offset != 0u ||
+		if (material_memory == nullptr ||
+		    (material_memory->offset & (sizeof(uint32_t) - 1u)) != 0u ||
 		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-			return false;
+			return reject("material key is not a scalar-buffer dword");
 		}
 		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr) {
-			return false;
+			return reject("material buffer handle is missing");
 		}
 
 		Value    selector;
@@ -460,19 +473,23 @@ private:
 		uint32_t selector_offset = 0;
 		if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_stride,
 		                         selector_offset)) {
-			return false;
+			return reject("material offset is not readfirstlane * stride");
 		}
+		if (selector_offset > UINT32_MAX - material_memory->offset) {
+			return reject("material instruction offset overflows the selector");
+		}
+		selector_offset += material_memory->offset;
 
 		const std::array<const Inst*, 1> material_users {shift};
 		std::array<const Inst*, 8>       heap_users {};
 		std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
 		const std::array<const Inst*, 1> image_users {&handle};
 		if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
-			return false;
+			return reject("material key or heap offset has extra users");
 		}
 		for (const auto* read: heap_reads) {
 			if (!UsesOnly(*read, image_users)) {
-				return false;
+				return reject("heap read has extra users");
 			}
 		}
 
@@ -483,7 +500,7 @@ private:
 		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
 		                             material_source) ||
 		    !MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
-			return false;
+			return reject("material or heap buffer is not a runtime value");
 		}
 
 		DescriptorSource image_source;
@@ -518,7 +535,9 @@ private:
 	}
 
 	bool MatchDenseTable(const Inst& handle, Inst*& heap_handle, const Inst*& based,
-	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices) {
+	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices,
+	                     uint32_t& table_base) {
+		table_base = 0;
 		for (uint32_t dword = 0; dword < handle.NumArgs(); dword++) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
@@ -553,8 +572,15 @@ private:
 				}
 				extra = immediate;
 			}
-			if (extra + memory->offset != dword * sizeof(uint32_t)) {
-				return false;
+			const uint32_t byte = extra + memory->offset;
+			if (dword == 0u) {
+				table_base = byte;
+			} else if (byte != table_base + dword * sizeof(uint32_t)) {
+				// s_load_dwordx8 keeps one ISA immediate on every component; the dword
+				// identity is MemoryInfo.component_index rather than a split offset.
+				if (extra != 0u || memory->component_index != dword || byte != table_base) {
+					return false;
+				}
 			}
 			auto* address = read->Arg(0).Resolve().TryInstruction();
 			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
@@ -1068,6 +1094,10 @@ private:
 	}
 
 	bool TryMakeDenseIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		auto reject = [&](const char* why) {
+			m_indirect_reason = why;
+			return false;
+		};
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -1075,34 +1105,45 @@ private:
 		const Inst*             based       = nullptr;
 		std::array<Inst*, 8>    reads {};
 		std::array<uint32_t, 8> memory_indices {};
-		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices)) {
-			return false;
+		uint32_t                memory_table_base = 0;
+		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices,
+		                     memory_table_base)) {
+			return reject("image dwords are not a dense address table");
 		}
-		uint32_t table_offset = 0;
-		Value    scaled_value;
-		if (based->GetOpcode() != ValueOpcode::IAdd32 || based->NumArgs() != 2u) {
-			return false;
-		}
-		if (ImmediateU32(based->Arg(1), table_offset)) {
-			scaled_value = based->Arg(0);
-		} else if (ImmediateU32(based->Arg(0), table_offset)) {
-			scaled_value = based->Arg(1);
+		uint32_t    table_offset = 0;
+		const Inst* scaled       = nullptr;
+		if (based->GetOpcode() == ValueOpcode::IAdd32 && based->NumArgs() == 2u) {
+			Value scaled_value;
+			if (ImmediateU32(based->Arg(1), table_offset)) {
+				scaled_value = based->Arg(0);
+			} else if (ImmediateU32(based->Arg(0), table_offset)) {
+				scaled_value = based->Arg(1);
+			} else {
+				return reject("table base add is not an immediate");
+			}
+			scaled = scaled_value.Resolve().TryInstruction();
+		} else if (based->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+			// DeS character-creation T# tables are `lsb << 5` with no added base.
+			scaled = based;
 		} else {
-			return false;
+			return reject("table offset is not key<<5 or (key<<5)+imm");
 		}
-		const auto* scaled = scaled_value.Resolve().TryInstruction();
-		uint32_t    shift  = 0;
+		if (table_offset > UINT32_MAX - memory_table_base) {
+			return reject("SMEM immediate overflows the table offset");
+		}
+		table_offset += memory_table_base;
+		uint32_t shift = 0;
 		if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
 		    scaled->NumArgs() != 2u || !ImmediateU32(scaled->Arg(1), shift) ||
 		    shift != DenseIndirectImageShift) {
-			return false;
+			return reject("table index is not shift-left 5");
 		}
 		auto*    key          = scaled->Arg(0).Resolve().TryInstruction();
 		uint32_t bound        = 0;
 		Value    loop_bound;
 		bool     bound_signed = false;
 		if (key == nullptr) {
-			return false;
+			return reject("dense table key is not an instruction");
 		}
 		uint32_t material_source = 0;
 		uint32_t selector_offset = 0;
@@ -1119,14 +1160,14 @@ private:
 		const std::array<const Inst*, 1> image_users {&handle};
 		for (const auto* read: reads) {
 			if (!UsesOnly(*read, image_users)) {
-				return false;
+				return reject("dense table load is used outside GetImageResource");
 			}
 		}
 
 		DescriptorSource heap_source;
 		uint32_t         heap_source_index = 0;
 		if (!MakeRuntimeAddressSource(*heap_handle, pc, heap_source_index, heap_source)) {
-			return false;
+			return reject("table address is not a runtime value");
 		}
 
 		uint32_t bound_source = DescriptorSource::IndirectImage::NoBoundSource;
@@ -1137,7 +1178,7 @@ private:
 			uint32_t    bad_dword        = 0;
 			std::string reason;
 			if (!ValidateSource(bound_descriptor, bad_dword, reason)) {
-				return false;
+				return reject("loop bound is not a runtime value");
 			}
 			bound_source = InternSource(bound_descriptor);
 		}
