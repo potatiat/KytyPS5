@@ -447,7 +447,6 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderGuestMemory,
 		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
@@ -455,8 +454,10 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			if (entry->second.last_snapshot.valid &&
+			const bool can_memoize =
 			    !entry->second.resource_plan.requires_specialization_memory &&
+			    entry->second.resource_plan.memory_info.empty();
+			if (entry->second.last_snapshot.valid && can_memoize &&
 			    entry->second.last_snapshot.shader_base == params.Base() &&
 			    entry->second.last_snapshot.user_data.size() == params.user_data.size() &&
 			    std::memcmp(entry->second.last_snapshot.user_data.data(), params.user_data.data(),
@@ -468,7 +469,7 @@ struct PipelineCache::ProgramCache {
 				                      ShaderRecompiler::IR::MaterializeResources(
 				                          entry->second.resource_plan, runtime, resources,
 				                          specialization, &report));
-				if (!entry->second.resource_plan.requires_specialization_memory) {
+				if (can_memoize) {
 					entry->second.last_snapshot.user_data.assign(params.user_data.begin(),
 					                                             params.user_data.end());
 					entry->second.last_snapshot.shader_base    = params.Base();
@@ -527,9 +528,10 @@ struct PipelineCache::ProgramCache {
 			ReportMaterialization(label, stage, params.hash, report,
 			                      ShaderRecompiler::IR::MaterializeResources(
 			                          resource_plan, runtime, resources, specialization, &report));
-			const bool requires_mem = resource_plan.requires_specialization_memory;
+			const bool can_memoize =
+			    !resource_plan.requires_specialization_memory && resource_plan.memory_info.empty();
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
-			if (!requires_mem) {
+			if (can_memoize) {
 				entry->second.last_snapshot.user_data.assign(params.user_data.begin(),
 				                                             params.user_data.end());
 				entry->second.last_snapshot.shader_base    = params.Base();
