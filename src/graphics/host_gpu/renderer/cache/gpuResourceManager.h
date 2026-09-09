@@ -40,6 +40,7 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	RangeSet                  m_bda_dirty_ranges;
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
 };

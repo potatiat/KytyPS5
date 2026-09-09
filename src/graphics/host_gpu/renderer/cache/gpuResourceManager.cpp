@@ -21,6 +21,9 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		const auto page_start = fault_vaddr & ~(BufferCache::CACHING_PAGESIZE - 1);
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_bda_dirty_ranges.Add(page_start, BufferCache::CACHING_PAGESIZE);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
@@ -33,6 +36,10 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_bda_dirty_ranges.Add(vaddr, size);
+	}
 	return true;
 }
 
@@ -48,6 +55,7 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
+		m_bda_dirty_ranges.Add(vaddr, size);
 	}
 }
 
@@ -67,6 +75,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_bda_dirty_ranges.Subtract(vaddr, size);
 	};
 	if (m_gpu == nullptr) {
 		unmap();
@@ -76,8 +85,16 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::PrepareBda() {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+	RangeSet dirty_ranges;
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		if (m_bda_dirty_ranges.Empty()) {
+			return;
+		}
+		dirty_ranges = std::move(m_bda_dirty_ranges);
+		m_bda_dirty_ranges.Clear();
+	}
+	dirty_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
 	m_fault_process_pending = true;

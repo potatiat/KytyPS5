@@ -17,14 +17,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-[[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
-	switch (type) {
-		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
-		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
-		case Prospero::ImageType::kColor2D: return vk::ImageType::e2D;
-		default: EXIT("non-base image type: %u\n", static_cast<uint32_t>(type));
-	}
-}
+
 
 [[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
                                                    const ImageInfo& info) {
