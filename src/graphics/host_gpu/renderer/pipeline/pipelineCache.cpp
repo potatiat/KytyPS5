@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -28,6 +29,7 @@
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <thread>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -464,12 +466,7 @@ void PipelineCache::InitializeDriverCache() {
 	const std::string_view git_hash     = KYTY_GIT_HASH;
 	const std::string_view git_revision = KYTY_GIT_REVISION;
 	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
+		PipelineCacheLog("Vulkan pipeline cache: git revision unknown, using fallback signature");
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
@@ -540,9 +537,26 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	SaveDriverCacheLocked(true);
+}
+
+void PipelineCache::FlushDriverCache() {
+	Common::LockGuard lock(m_mutex);
+	SaveDriverCacheLocked(false);
+}
+
+void PipelineCache::SaveDriverCacheLocked(bool destroy_cache) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+
+	static std::atomic<uint64_t> s_last_save_time {0};
+	const auto                   now  = Common::Timer::QueryPerformanceCounter();
+	const auto                   freq = Common::Timer::QueryPerformanceFrequency();
+	if (!destroy_cache && (now - s_last_save_time.load(std::memory_order_relaxed)) < freq * 30u) {
+		return;
+	}
+	s_last_save_time.store(now, std::memory_order_relaxed);
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -576,6 +590,29 @@ void PipelineCache::Save() {
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
+
+	if (!destroy_cache) {
+		std::thread([dest = m_driver_cache_path, temp = temp_path, prefix_data = std::move(prefix),
+		             payload_data = std::move(payload), byte_size = size]() mutable {
+			Common::File file;
+			uint32_t     prefix_written  = 0;
+			uint32_t     payload_written = 0;
+			if (file.Create(temp)) {
+				file.Write(prefix_data.data(), static_cast<uint32_t>(prefix_data.size()), &prefix_written);
+				file.Write(payload_data.data(), static_cast<uint32_t>(payload_data.size()), &payload_written);
+			}
+			const bool flushed = !file.IsInvalid() && file.Flush();
+			file.Close();
+			if (prefix_written == prefix_data.size() && payload_written == payload_data.size() && flushed &&
+			    Common::File::RenameFile(temp, dest)) {
+				PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", byte_size,
+				                 Common::PathToString(dest));
+			}
+		}).detach();
+		m_new_pipelines_since_save.store(0, std::memory_order_relaxed);
+		return;
+	}
+
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
@@ -593,8 +630,11 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_new_pipelines_since_save.store(0, std::memory_order_relaxed);
+	if (destroy_cache) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -804,7 +844,34 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	// Fast-path: 16-entry MRU scan
+	for (size_t i = 0; i < GRAPHICS_MRU_SIZE; i++) {
+		if (m_graphics_mru[i].vs_id == vs_id && m_graphics_mru[i].ps_id == ps_id &&
+		    m_graphics_mru[i].pipeline != nullptr) {
+			if (m_graphics_mru[i].key == key) {
+				auto* hit_pipeline = m_graphics_mru[i].pipeline;
+				if (i > 0) {
+					auto hit_entry = std::move(m_graphics_mru[i]);
+					for (size_t j = i; j > 0; j--) {
+						m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
+					}
+					m_graphics_mru[0] = std::move(hit_entry);
+				}
+				return *hit_pipeline;
+			}
+		}
+	}
+
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		for (size_t j = GRAPHICS_MRU_SIZE - 1; j > 0; j--) {
+			m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
+		}
+		m_graphics_mru[0] = {
+		    .vs_id    = vs_id,
+		    .ps_id    = ps_id,
+		    .key      = iter->first,
+		    .pipeline = iter->second.get(),
+		};
 		return *iter->second;
 	}
 
@@ -828,8 +895,22 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
+
+	for (size_t j = GRAPHICS_MRU_SIZE - 1; j > 0; j--) {
+		m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
+	}
+	m_graphics_mru[0] = {
+	    .vs_id    = vs_id,
+	    .ps_id    = ps_id,
+	    .key      = iter->first,
+	    .pipeline = iter->second.get(),
+	};
+
+	if (m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed) + 1 >= 32) {
+		SaveDriverCacheLocked(false);
+	}
 
 	return *iter->second;
 }
@@ -841,10 +922,29 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// Fast-path: 16-entry MRU scan (linear search over 256 bytes in L1 cache)
+	for (size_t i = 0; i < COMPUTE_MRU_SIZE; i++) {
+		if (m_compute_mru[i].id == compute_program.id && m_compute_mru[i].pipeline != nullptr) {
+			auto* hit_pipeline = m_compute_mru[i].pipeline;
+			if (i > 0) {
+				auto hit_entry = m_compute_mru[i];
+				for (size_t j = i; j > 0; j--) {
+					m_compute_mru[j] = m_compute_mru[j - 1];
+				}
+				m_compute_mru[0] = hit_entry;
+			}
+			return *hit_pipeline;
+		}
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
+			m_compute_mru[j] = m_compute_mru[j - 1];
+		}
+		m_compute_mru[0] = {.id = compute_program.id, .pipeline = iter->second.get()};
 		return *iter->second;
 	}
 
@@ -860,6 +960,15 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+
+	for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
+		m_compute_mru[j] = m_compute_mru[j - 1];
+	}
+	m_compute_mru[0] = {.id = compute_program.id, .pipeline = iter->second.get()};
+
+	if (m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed) + 1 >= 32) {
+		SaveDriverCacheLocked(false);
+	}
 
 	return *iter->second;
 }

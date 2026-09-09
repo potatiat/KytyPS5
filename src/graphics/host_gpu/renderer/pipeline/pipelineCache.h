@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -113,6 +115,7 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	void FlushDriverCache();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -214,9 +217,26 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	Common::Mutex         m_mutex;
+	struct ComputeMruEntry {
+		uint64_t  id       = 0;
+		Pipeline* pipeline = nullptr;
+	};
+	static constexpr size_t COMPUTE_MRU_SIZE = 16;
+	std::array<ComputeMruEntry, COMPUTE_MRU_SIZE> m_compute_mru {};
+
+	struct GraphicsMruEntry {
+		uint64_t            vs_id    = 0;
+		uint64_t            ps_id    = 0;
+		GraphicsPipelineKey key {};
+		Pipeline*           pipeline = nullptr;
+	};
+	static constexpr size_t GRAPHICS_MRU_SIZE = 16;
+	std::array<GraphicsMruEntry, GRAPHICS_MRU_SIZE> m_graphics_mru {};
+	std::atomic<uint32_t> m_new_pipelines_since_save {0};
 
 	void InitializeDriverCache();
+	void SaveDriverCacheLocked(bool destroy_cache);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
