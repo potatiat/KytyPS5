@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -428,7 +429,12 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
-	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
+	if (buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "Image::CopyImageWithBuffer: invalid buffer or multisample (src_samples=%u, dst_samples=%u)\n",
+		           source.backing.samples, backing.samples);
+		return;
+	}
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
@@ -443,8 +449,13 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	                                       : info.bytes_per_block;
 	const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
 	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
-	EXIT_IF(levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
-	        source_block != destination_block);
+	if (levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
+	    source_block != destination_block) {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "Image::CopyImageWithBuffer: incompatible parameters (levels=%u, src_bytes=%u, dst_bytes=%u, src_block=%u, dst_block=%u)\n",
+		           levels, source_bytes, destination_bytes, source_block, destination_block);
+		return;
+	}
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
@@ -477,7 +488,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 		const auto row_size =
 		    static_cast<uint64_t>((width + source_block - 1) / source_block) * source_bytes;
 		const auto rows_per_copy = CopyRows(row_size, block_rows, buffer.Size());
-		EXIT_IF(slices == 0 || rows_per_copy == 0);
+		if (slices == 0 || rows_per_copy == 0) {
+			continue;
+		}
 		for (uint32_t slice = 0; slice < slices; slice++) {
 			for (uint32_t block_row = 0; block_row < block_rows; block_row += rows_per_copy) {
 				const auto          copy_rows   = std::min(rows_per_copy, block_rows - block_row);

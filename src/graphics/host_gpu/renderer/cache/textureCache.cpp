@@ -695,8 +695,35 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
-		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-		destination.CopyImageWithBuffer(source, copy_buffer);
+		const uint32_t levels = std::min(source.backing.mip_levels, destination.backing.mip_levels);
+		const auto     source_bytes = DepthAspectTransferBytes(source.backing.format) != 0
+		                                  ? DepthAspectTransferBytes(source.backing.format)
+		                                  : source.info.bytes_per_block;
+		const auto     destination_bytes = DepthAspectTransferBytes(destination.backing.format) != 0
+		                                       ? DepthAspectTransferBytes(destination.backing.format)
+		                                       : destination.info.bytes_per_block;
+		const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
+		const uint32_t destination_block = destination.info.IsBlock() ? 4u : 1u;
+
+		const bool can_copy_with_buffer =
+		    levels > 0 && source_bytes != 0 && source_bytes == destination_bytes &&
+		    source_block == destination_block;
+
+		if (can_copy_with_buffer) {
+			auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			destination.CopyImageWithBuffer(source, copy_buffer);
+		} else {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: incompatible formats for image copy (%u -> %u, bpp %u -> %u), falling back to guest buffer\n",
+			           static_cast<uint32_t>(source.backing.format),
+			           static_cast<uint32_t>(destination.backing.format),
+			           source_bytes, destination_bytes);
+			if (source.IsGpuModified() && SafeToDownload(source)) {
+				(void)TryDownloadImage(source_id);
+			}
+			destination.MarkBufferModified();
+			return;
+		}
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -824,14 +851,17 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
-		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
-		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
-		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
+		    cached.backing.format == replacement.backing.format ||
+		    (cached.backing.samples == 1 &&
+		     ((!cached.info.IsDepth() && !replacement.info.IsDepth() &&
+		       ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format)) ||
+		      (cached.info.bytes_per_block == replacement.info.bytes_per_block &&
+		       cached.info.IsBlock() == replacement.info.IsBlock())));
 		if (copy_supported) {
 			CopyImage(replacement_id, cached_id);
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
-			           "TextureCache: unsupported cross-format multisample depth copy\n");
+			           "TextureCache: unsupported cross-format depth overlap copy\n");
 		}
 	} else if (cached.backing.samples == 1 && replacement.backing.samples > 1 &&
 	           replacement.info.IsDepth()) {
