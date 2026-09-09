@@ -668,17 +668,26 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			rejection = "footprint exceeds 32 bits";
 		}
 	}
+	if (rejection == nullptr) {
+		if (size.size == 0) {
+			rejection = "zero size";
+		} else if (size.align == 0) {
+			rejection = "zero alignment";
+		} else if ((address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+			rejection = "unaligned base address";
+		}
+	}
 	if (rejection != nullptr) {
 		const auto report = fmt::format(
 		    "unrepresentable texture ({}): {}x{} depth={} layers={} levels={} format={} tile={} "
 		    "type={} base_array={} array_pitch={} max_mip={} kind={} dimension={} source={} "
-		    "first_use_pc=0x{:08x} indirect_root={} addr=0x{:016x} "
+		    "first_use_pc=0x{:08x} indirect_root={} addr=0x{:016x} align=0x{:08x} "
 		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
 		    rejection, width, height, depth, image_layers, levels, static_cast<uint32_t>(format),
 		    static_cast<uint32_t>(tile), static_cast<uint32_t>(type), descriptor.BaseArray5(),
 		    descriptor.ArrayPitch(), descriptor.MaxMip(), static_cast<uint32_t>(resource.resource_class),
 		    static_cast<uint32_t>(resource.dimension), resource.source, resource.first_use_pc,
-		    resource.indirect_root, address, descriptor.fields[0], descriptor.fields[1],
+		    resource.indirect_root, address, size.align, descriptor.fields[0], descriptor.fields[1],
 		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		    descriptor.fields[6], descriptor.fields[7]);
 		if (storage) {
@@ -701,8 +710,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 		     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}

@@ -523,7 +523,7 @@ struct RenderExecutorTestAccess {
                                           RenderColorInfo *colors,
                                           uint32_t color_count,
                                           RenderDepthInfo &depth,
-                                          const std::optional<PreparedBindings> &pixel = std::nullopt) {
+                                          const PreparedBindings *pixel = nullptr) {
     return executor.AcquireRenderTargets(buffer, colors, color_count, depth, pixel);
   }
 
