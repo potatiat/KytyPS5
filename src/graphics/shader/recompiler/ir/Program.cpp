@@ -684,8 +684,18 @@ std::string ProgramToString(const Program& program) {
 				}
 			}
 			text +=
-			    fmt::format(" ({}; uses={})\n", TypeName(Value(const_cast<Inst*>(&inst)).GetType()),
+			    fmt::format(" ({}; uses={}", TypeName(Value(const_cast<Inst*>(&inst)).GetType()),
 			                inst.UseCount());
+			if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index < program.memory_info.size()) {
+					const auto& memory = program.memory_info[flags.index];
+					text += fmt::format("; off=0x{:x} c={}/{}", memory.offset,
+					                    memory.component_index, memory.component_count);
+				}
+			}
+			text += ")\n";
 		}
 	}
 	return text;

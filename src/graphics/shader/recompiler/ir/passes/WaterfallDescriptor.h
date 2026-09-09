@@ -19,6 +19,7 @@ struct WaterfallDescriptor {
 	Value       heap;
 	uint32_t    table_offset = 0;
 	uint32_t    stride_shift = 0;
+	uint32_t    lane_and     = 31u;
 
 	bool operator==(const WaterfallDescriptor& other) const = default;
 };

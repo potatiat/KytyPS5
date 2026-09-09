@@ -5,9 +5,6 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint32_t LaneIndexBits = 5u;
-constexpr uint32_t LaneIndexMask = (1u << LaneIndexBits) - 1u;
-
 bool ImmediateU32(Value value, uint32_t& result) {
 	value = value.Resolve();
 	if (!value.IsImmediate() || value.GetType() != Type::U32) {
@@ -35,7 +32,11 @@ bool CommutativeImmediate(const Inst& inst, uint32_t& immediate, Value& other) {
 	return false;
 }
 
-const Inst* MatchLowestSetBit(Value value, const Inst& mask_phi) {
+bool AcceptLaneAnd(uint32_t bits) {
+	return bits == 31u || bits == 63u;
+}
+
+const Inst* MatchLowestSetBit(Value value, const Inst& mask_phi, uint32_t* lane_and = nullptr) {
 	const auto* shift = Match(value, ValueOpcode::ShiftLeftLogical32, 2);
 	uint32_t    one   = 0;
 	if (shift == nullptr || !ImmediateU32(shift->Arg(0), one) || one != 1u) {
@@ -44,27 +45,49 @@ const Inst* MatchLowestSetBit(Value value, const Inst& mask_phi) {
 	const auto* masked = Match(shift->Arg(1), ValueOpcode::BitwiseAnd32, 2);
 	uint32_t    bits   = 0;
 	Value       index;
-	if (masked == nullptr || !CommutativeImmediate(*masked, bits, index) || bits != LaneIndexMask) {
+	if (masked == nullptr || !CommutativeImmediate(*masked, bits, index) || !AcceptLaneAnd(bits)) {
 		return nullptr;
 	}
 	const auto* lsb = Match(index, ValueOpcode::FindILsb32, 1);
 	if (lsb == nullptr || lsb->Arg(0).Resolve().TryInstruction() != &mask_phi) {
 		return nullptr;
 	}
+	if (lane_and != nullptr) {
+		*lane_and = bits;
+	}
 	return lsb;
 }
 
-const Inst* MatchClearedMask(Value latch, const Inst& mask_phi) {
-	const auto* cleared = Match(latch, ValueOpcode::BitwiseXor32, 2);
+const Inst* MatchClearedMask(Value latch, const Inst& mask_phi, uint32_t* lane_and = nullptr) {
+	if (const auto* cleared = Match(latch, ValueOpcode::BitwiseXor32, 2)) {
+		for (size_t side = 0; side < 2u; side++) {
+			if (cleared->Arg(side).Resolve().TryInstruction() != &mask_phi) {
+				continue;
+			}
+			if (const auto* lsb =
+			        MatchLowestSetBit(cleared->Arg(1u - side), mask_phi, lane_and)) {
+				return lsb;
+			}
+		}
+	}
+	const auto* cleared = Match(latch, ValueOpcode::BitwiseAnd32, 2);
 	if (cleared == nullptr) {
 		return nullptr;
 	}
 	for (size_t side = 0; side < 2u; side++) {
-		if (cleared->Arg(side).Resolve().TryInstruction() != &mask_phi) {
+		const auto* operand = cleared->Arg(side).Resolve().TryInstruction();
+		const auto* inverted = Match(cleared->Arg(1u - side), ValueOpcode::BitwiseNot32, 1);
+		if (inverted == nullptr) {
 			continue;
 		}
-		if (const auto* lsb = MatchLowestSetBit(cleared->Arg(1u - side), mask_phi)) {
-			return lsb;
+		if (operand == &mask_phi) {
+			if (const auto* lsb = MatchLowestSetBit(inverted->Arg(0), mask_phi, lane_and)) {
+				return lsb;
+			}
+		} else if (operand != nullptr && operand->GetOpcode() == ValueOpcode::Phi) {
+			if (const auto* lsb = MatchLowestSetBit(inverted->Arg(0), *operand, lane_and)) {
+				return lsb;
+			}
 		}
 	}
 	return nullptr;
@@ -129,22 +152,36 @@ const Inst* MatchTableOffset(const Inst& index, uint32_t& stride_shift, uint32_t
 	    stride_shift > 31u) {
 		return nullptr;
 	}
-	const Inst* based = nullptr;
+	const Inst* based          = nullptr;
+	bool        used_as_offset = false;
 	for (const auto& use: scaled->Uses()) {
 		uint32_t immediate = 0;
 		Value    other;
-		if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::IAdd32 ||
-		    use.user->NumArgs() != 2u || !CommutativeImmediate(*use.user, immediate, other)) {
+		if (use.user != nullptr && use.user->GetOpcode() == ValueOpcode::IAdd32 &&
+		    use.user->NumArgs() == 2u && CommutativeImmediate(*use.user, immediate, other)) {
+			if (based != nullptr) {
+				return nullptr;
+			}
+			scaled_out   = scaled;
+			based        = use.user;
+			table_offset = immediate;
 			continue;
 		}
-		if (based != nullptr) {
-			return nullptr;
+		if (use.user != nullptr && use.operand == 1u &&
+		    (use.user->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+		     use.user->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+			used_as_offset = true;
 		}
-		scaled_out   = scaled;
-		based        = use.user;
-		table_offset = immediate;
 	}
-	return based;
+	if (based != nullptr) {
+		return based;
+	}
+	if (used_as_offset) {
+		scaled_out   = scaled;
+		table_offset = 0;
+		return scaled;
+	}
+	return nullptr;
 }
 
 bool LaneIndexSource(Value value, Value& source, uint32_t& shift) {
@@ -216,7 +253,7 @@ const Inst* FindBallotBit(const Program& program, Value entry, Value key,
 		Value       index;
 		const auto* masked = Match(inst->Arg(1), ValueOpcode::BitwiseAnd32, 2);
 		if (ImmediateU32(inst->Arg(0), one) && one == 1u && masked != nullptr &&
-		    CommutativeImmediate(*masked, bits, index) && bits == LaneIndexMask &&
+		    CommutativeImmediate(*masked, bits, index) && AcceptLaneAnd(bits) &&
 		    SameLaneIndex(program, index, key)) {
 			return inst;
 		}
@@ -248,7 +285,9 @@ bool ReducesInto(const Inst& node, const Inst& root, std::vector<const Inst*>& v
 const Inst* MatchImageHandle(const Program& program, const Inst& based, Value& heap) {
 	const Inst* handle = nullptr;
 	for (const auto& use: based.Uses()) {
-		if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::LoadAddressU32) {
+		if (use.user == nullptr ||
+		    (use.user->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+		     use.user->GetOpcode() != ValueOpcode::ReadConstBuffer)) {
 			continue;
 		}
 		for (const auto& consumer: use.user->Uses()) {
@@ -268,6 +307,9 @@ const Inst* MatchImageHandle(const Program& program, const Inst& based, Value& h
 	for (size_t dword = 0; dword < handle->NumArgs(); dword++) {
 		const auto* load = Match(handle->Arg(dword), ValueOpcode::LoadAddressU32, 4);
 		if (load == nullptr) {
+			load = Match(handle->Arg(dword), ValueOpcode::ReadConstBuffer, 2);
+		}
+		if (load == nullptr || load->NumArgs() < 2u) {
 			return nullptr;
 		}
 		if (load->Arg(1).Resolve().TryInstruction() != &based) {
@@ -288,6 +330,62 @@ const Inst* MatchImageHandle(const Program& program, const Inst& based, Value& h
 	return handle;
 }
 
+bool ImageUsesMask(const Inst& mask_phi) {
+	for (const auto& use: mask_phi.Uses()) {
+		if (use.user != nullptr && use.user->GetOpcode() == ValueOpcode::GetImageResource) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool MatchReadFirstLaneLoop(const Program& program, Value latch_val, const Inst& mask_phi,
+                            const Inst*& rfl_out, const Inst*& compare_out, Value& key_out) {
+	const auto* latch = Match(latch_val, ValueOpcode::LogicalAnd, 2);
+	if (latch == nullptr) {
+		return false;
+	}
+	for (size_t side = 0; side < 2u; side++) {
+		if (latch->Arg(side).Resolve().TryInstruction() != &mask_phi) {
+			continue;
+		}
+		const auto* inverted = Match(latch->Arg(1u - side), ValueOpcode::LogicalNot, 1);
+		if (inverted == nullptr) {
+			continue;
+		}
+		const auto* inner = inverted->Arg(0).Resolve().TryInstruction();
+		while (inner != nullptr && inner->GetOpcode() == ValueOpcode::LogicalAnd &&
+		       inner->NumArgs() == 2u) {
+			if (inner->Arg(0).Resolve().TryInstruction() == &mask_phi) {
+				inner = inner->Arg(1).Resolve().TryInstruction();
+			} else if (inner->Arg(1).Resolve().TryInstruction() == &mask_phi) {
+				inner = inner->Arg(0).Resolve().TryInstruction();
+			} else {
+				break;
+			}
+		}
+		if (inner == nullptr || inner->GetOpcode() != ValueOpcode::IEqual32 ||
+		    inner->NumArgs() != 2u) {
+			continue;
+		}
+		for (size_t comp_side = 0; comp_side < 2u; comp_side++) {
+			const auto* rfl = Match(inner->Arg(comp_side), ValueOpcode::ReadFirstLane, 2);
+			if (rfl == nullptr) {
+				continue;
+			}
+			const auto key = inner->Arg(1u - comp_side);
+			if (!EquivalentValue(program, rfl->Arg(0), key)) {
+				continue;
+			}
+			rfl_out     = rfl;
+			compare_out = inner;
+			key_out     = key;
+			return true;
+		}
+	}
+	return false;
+}
+
 }
 
 std::vector<WaterfallDescriptor> FindWaterfallDescriptors(const Program& program) {
@@ -298,41 +396,70 @@ std::vector<WaterfallDescriptor> FindWaterfallDescriptors(const Program& program
 				continue;
 			}
 			for (size_t latch = 0; latch < 2u; latch++) {
-				const auto* lsb = MatchClearedMask(inst.Arg(latch), inst);
-				if (lsb == nullptr) {
-					continue;
-				}
-				const auto               entry = inst.Arg(1u - latch);
-				std::vector<const Inst*> visited;
-				if (Reaches(entry, inst, visited)) {
-					continue;
-				}
-				WaterfallDescriptor found;
-				found.mask_phi = &inst;
-				found.index    = lsb;
-				found.entry    = entry;
-				found.latch = latch;
-				if (!MatchKey(*lsb, found.key, found.compare)) {
+				uint32_t    lane_and = 31u;
+				const auto* lsb      = MatchClearedMask(inst.Arg(latch), inst, &lane_and);
+				if (lsb != nullptr) {
+					const auto               entry = inst.Arg(1u - latch);
+					std::vector<const Inst*> visited;
+					if (Reaches(entry, inst, visited)) {
+						continue;
+					}
+					WaterfallDescriptor found;
+					found.mask_phi = &inst;
+					found.index    = lsb;
+					found.entry    = entry;
+					found.latch    = latch;
+					found.lane_and = lane_and;
+					const bool used_as_image = ImageUsesMask(inst);
+					if (MatchKey(*lsb, found.key, found.compare)) {
+						std::vector<const Inst*> seen;
+						const auto* bit = FindBallotBit(program, found.entry, found.key, seen);
+						std::vector<const Inst*> reduction;
+						const auto* root = found.entry.Resolve().TryInstruction();
+						if (bit != nullptr && root != nullptr &&
+						    ReducesInto(*bit, *root, reduction)) {
+							const auto* based = MatchTableOffset(
+							    *lsb, found.stride_shift, found.table_offset, found.scaled);
+							if (based != nullptr) {
+								found.handle = MatchImageHandle(program, *based, found.heap);
+							}
+						}
+					}
+					if (found.handle == nullptr && !used_as_image) {
+						break;
+					}
+					result.push_back(found);
 					break;
 				}
-				std::vector<const Inst*> seen;
-				const auto* bit = FindBallotBit(program, found.entry, found.key, seen);
-				std::vector<const Inst*> reduction;
-				const auto* root = found.entry.Resolve().TryInstruction();
-				if (bit == nullptr || root == nullptr || !ReducesInto(*bit, *root, reduction)) {
+
+				const Inst* rfl     = nullptr;
+				const Inst* compare = nullptr;
+				Value       key;
+				if (MatchReadFirstLaneLoop(program, inst.Arg(latch), inst, rfl, compare, key)) {
+					const auto               entry = inst.Arg(1u - latch);
+					std::vector<const Inst*> visited;
+					if (Reaches(entry, inst, visited)) {
+						continue;
+					}
+					WaterfallDescriptor found;
+					found.mask_phi = &inst;
+					found.index    = rfl;
+					found.entry    = entry;
+					found.latch    = latch;
+					found.lane_and = program.wave_size > 32u ? 63u : 31u;
+					found.key      = key;
+					found.compare  = compare;
+					const auto* based = MatchTableOffset(
+					    *rfl, found.stride_shift, found.table_offset, found.scaled);
+					if (based != nullptr) {
+						found.handle = MatchImageHandle(program, *based, found.heap);
+					}
+					if (found.handle == nullptr && !ImageUsesMask(inst)) {
+						break;
+					}
+					result.push_back(found);
 					break;
 				}
-				const auto* based =
-				    MatchTableOffset(*lsb, found.stride_shift, found.table_offset, found.scaled);
-				if (based == nullptr) {
-					break;
-				}
-				found.handle = MatchImageHandle(program, *based, found.heap);
-				if (found.handle == nullptr) {
-					break;
-				}
-				result.push_back(found);
-				break;
 			}
 		}
 	}
@@ -342,20 +469,26 @@ std::vector<WaterfallDescriptor> FindWaterfallDescriptors(const Program& program
 uint32_t RewriteWaterfallDescriptors(Program& program) {
 	uint32_t rewritten = 0;
 	for (const auto& found: FindWaterfallDescriptors(program)) {
-		const_cast<Inst*>(found.scaled)->SetArg(0, found.key);
-		auto*      compare = const_cast<Inst*>(found.compare);
-		auto*      block   = compare->Parent();
-		const auto at      = std::ranges::find_if(
-            *block, [&](const Inst& inst) { return &inst == compare; });
-		const auto bound = block->PrependNewInst(
-		    at, ValueOpcode::ULessThan32, {found.key, Value(uint32_t {1} << LaneIndexBits)});
-		compare->ReplaceUsesWith(Value(&*bound));
-		auto* mask = const_cast<Inst*>(found.mask_phi);
-		mask->SetArg(found.latch, Value(0u));
-		mask->SetArg(found.latch == 0u ? 1u : 0u, Value(1u));
+		if (found.scaled != nullptr && !found.key.IsEmpty()) {
+			const_cast<Inst*>(found.scaled)->SetArg(0, found.key);
+		}
+		if (found.compare != nullptr && !found.key.IsEmpty()) {
+			auto*      compare = const_cast<Inst*>(found.compare);
+			auto*      block   = compare->Parent();
+			const auto at      = std::ranges::find_if(
+                *block, [&](const Inst& inst) { return &inst == compare; });
+			const auto bound = block->PrependNewInst(
+			    at, ValueOpcode::ULessThan32, {found.key, Value(found.lane_and + 1u)});
+			compare->ReplaceUsesWith(Value(&*bound));
+		}
+		auto*      mask  = const_cast<Inst*>(found.mask_phi);
+		const bool is_u1 = mask->GetType() == Type::U1;
+		mask->SetArg(found.latch, is_u1 ? Value(false) : Value(0u));
+		mask->SetArg(found.latch == 0u ? 1u : 0u, is_u1 ? Value(true) : Value(1u));
 		rewritten++;
 	}
 	return rewritten;
 }
 
 }
+
