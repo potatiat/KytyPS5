@@ -116,6 +116,9 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 	void FlushDriverCache();
+	[[nodiscard]] uint32_t NewPipelinesSinceSave() const noexcept {
+		return m_new_pipelines_since_save.load(std::memory_order_relaxed);
+	}
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
