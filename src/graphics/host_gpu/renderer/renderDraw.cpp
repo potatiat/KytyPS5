@@ -317,7 +317,8 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderColorInfo* colors, uint32_t color_count,
-                                     const RenderDepthInfo& depth) {
+                                     const RenderDepthInfo& depth,
+                                     RenderExecutor::DynamicStateCache& cache) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(colors == nullptr);
@@ -372,8 +373,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+
+	const bool is_new_buffer = (cache.last_vk_buffer != vk_buffer);
+	if (is_new_buffer) {
+		cache.Invalidate();
+		cache.last_vk_buffer = vk_buffer;
+	}
+
+	if (is_new_buffer || cache.viewport_count != viewport_count ||
+	    std::memcmp(cache.viewports.data(), viewports.data(), viewport_count * sizeof(vk::Viewport)) != 0) {
+		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+		cache.viewport_count = viewport_count;
+		std::memcpy(cache.viewports.data(), viewports.data(), viewport_count * sizeof(vk::Viewport));
+	}
+
+	if (is_new_buffer || cache.scissor_count != viewport_count ||
+	    std::memcmp(cache.scissors.data(), scissors.data(), viewport_count * sizeof(vk::Rect2D)) != 0) {
+		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+		cache.scissor_count = viewport_count;
+		std::memcpy(cache.scissors.data(), scissors.data(), viewport_count * sizeof(vk::Rect2D));
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -386,29 +405,59 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	if (is_new_buffer || cache.line_width != line_width) {
+		vk_buffer.setLineWidth(line_width);
+		cache.line_width = line_width;
+	}
+
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	if (is_new_buffer || cache.blend_constants != blend_constants) {
+		vk_buffer.setBlendConstants(blend_constants.data());
+		cache.blend_constants = blend_constants;
+	}
+
+	const int depth_test = depth.depth_test_enable ? 1 : 0;
+	if (is_new_buffer || cache.depth_test_enable != depth_test) {
+		vk_buffer.setDepthTestEnable(depth_test ? VK_TRUE : VK_FALSE);
+		cache.depth_test_enable = depth_test;
+	}
+
+	const int depth_write = depth.depth_write_enable ? 1 : 0;
+	if (is_new_buffer || cache.depth_write_enable != depth_write) {
+		vk_buffer.setDepthWriteEnable(depth_write ? VK_TRUE : VK_FALSE);
+		cache.depth_write_enable = depth_write;
+	}
+
+	if (is_new_buffer || cache.depth_compare_op != depth.depth_compare_op) {
+		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+		cache.depth_compare_op = depth.depth_compare_op;
+	}
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	const int   db_enable         = depth_bias_enable ? 1 : 0;
+	if (is_new_buffer || cache.depth_bias_enable != db_enable) {
+		vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+		cache.depth_bias_enable = db_enable;
+	}
 	if (depth_bias_enable) {
-		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
 		const float constant_factor = ConvertPolygonOffsetConstantFactor(
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		if (is_new_buffer || cache.depth_bias_const != constant_factor ||
+		    cache.depth_bias_clamp != poly_offset.clamp || cache.depth_bias_slope != slope_factor) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+			cache.depth_bias_const = constant_factor;
+			cache.depth_bias_clamp = poly_offset.clamp;
+			cache.depth_bias_slope = slope_factor;
+		}
 	}
 
 	if (depth.stencil_test_enable) {
@@ -431,15 +480,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
 	for (uint32_t i = 0; i < color_count; i++) {
 		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
 		                ? VK_TRUE
 		                : VK_FALSE;
 	}
 	if (color_count != 0) {
-		vk_buffer.setColorWriteEnableEXT(color_count, enable);
+		if (is_new_buffer || cache.color_write_count != color_count ||
+		    std::memcmp(cache.color_write_enable.data(), enable, color_count * sizeof(vk::Bool32)) != 0) {
+			vk_buffer.setColorWriteEnableEXT(color_count, enable);
+			cache.color_write_count = color_count;
+			std::memcpy(cache.color_write_enable.data(), enable, color_count * sizeof(vk::Bool32));
+		}
 	}
 #endif
 }
@@ -576,7 +628,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const bool feedback = depth.depth_write_enable && pixel &&
+		const bool feedback = depth.depth_write_enable && pixel.has_value() &&
 		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
 			    if (binding.image_id != depth.image_id ||
 			        binding.desc.type != TextureCache::BindingType::Texture) {
@@ -598,10 +650,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 		                       : depth_attachment_layout(depth);
-		const bool written =
-		    depth.depth_write_enable ||
-		    static_cast<bool>(depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil);
-		if (!feedback && written && image.binding.is_bound) {
+		vk::ImageAspectFlags written_aspects {};
+		if (depth.depth_write_enable) {
+			written_aspects |= vk::ImageAspectFlagBits::eDepth;
+		}
+		if (depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil) {
+			written_aspects |= vk::ImageAspectFlagBits::eStencil;
+		}
+		const bool aspect_conflict =
+		    image.binding.is_bound &&
+		    (image.binding.sampled_aspects.operator bool()
+		         ? static_cast<bool>(image.binding.sampled_aspects & written_aspects)
+		         : written_aspects.operator bool());
+		if (!feedback && aspect_conflict) {
 			layout = vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
@@ -1188,7 +1249,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
-	                         state.color_count, state.depth_info);
+	                         state.color_count, state.depth_info, m_dynamic_state_cache);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
 		    rendering.depth_stencil_attachment.image_layout ==
@@ -1239,25 +1300,25 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
-	auto& ucfg   = buffer.GetUserConfig();
+	if (args.index_count == 0 || args.instance_count == 0) {
+		return;
+	}
+
 	auto& sh_ctx = buffer.GetShaders();
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return;
+	}
+
+	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ucfg = buffer.GetUserConfig();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
-		return;
-	}
-
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
-		return;
-	}
-
-	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
 	}
 
@@ -1355,25 +1416,25 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
-	auto& ucfg   = buffer.GetUserConfig();
+	if (args.vertex_count == 0 || args.instance_count == 0) {
+		return;
+	}
+
 	auto& sh_ctx = buffer.GetShaders();
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return;
+	}
+
+	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ucfg = buffer.GetUserConfig();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
-		return;
-	}
-
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
-		return;
-	}
-
-	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return;
 	}
 

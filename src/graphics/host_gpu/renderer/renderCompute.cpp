@@ -462,16 +462,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
-	FindBuffers(bindings);
+	PrepareBindings(input_info.stage, m_compute_bindings);
+	FindBuffers(m_compute_bindings);
 	if (program.info.uses_dma) {
 		m_context.GetGpuResources().PrepareBda();
 	}
-	RebindBuffers(bindings);
-	RebindImages(bindings);
+	RebindBuffers(m_compute_bindings);
+	RebindImages(m_compute_bindings);
 
 	auto              vk_buffer        = buffer.Handle();
-	PreparedBindings* descriptor_stage = &bindings;
+	PreparedBindings* descriptor_stage = &m_compute_bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
@@ -513,13 +513,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// Read-only dispatches need ordering, but no memory visibility operation.
 	const bool writes_memory =
-	    has_storage_writes || program.info.uses_dma || bindings.gds.buffer != nullptr ||
+	    has_storage_writes || program.info.uses_dma || m_compute_bindings.gds.buffer != nullptr ||
 	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
 	                [](const auto& resource) { return resource.written || resource.atomic; }) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& resource) { return resource.written || resource.atomic; });
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
 	ResetBindings();
+	m_context.GetCommandScheduler().PopPendingOperations();
 }
 
 } // namespace Libs::Graphics

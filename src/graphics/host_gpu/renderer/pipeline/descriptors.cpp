@@ -140,19 +140,30 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range is unsupported\n");
+	const auto  max_range = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	if (size > max_range) {
+		static std::atomic<uint32_t> s_range_warn {0};
+		if (s_range_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("StorageBuffer size exceeds maxStorageBufferRange: 0x%" PRIx64 " > 0x%" PRIx64 " (clamping)\n",
+			     size, max_range);
+		}
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	const auto safe_size = std::min<uint64_t>(size, max_range);
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, safe_size, resource.written,
 	                                                              resource.formatted, id);
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || safe_size > max_range - adjustment) {
+		static std::atomic<uint32_t> s_warn_count {0};
+		if (s_warn_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("StorageBuffer unaligned offset: offset=0x%" PRIx64 " aligned=0x%" PRIx64
+			     " adj=%" PRIu64 " size=0x%" PRIx64 " (clamping to max_range)\n",
+			     offset, aligned_offset, adjustment, safe_size);
+		}
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	buffer_offset = static_cast<uint32_t>(std::min<uint64_t>(adjustment, 252u) & ~3u);
+	const auto clamped_size = std::min<uint64_t>(safe_size + adjustment, max_range);
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, clamped_size};
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -715,6 +726,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
 	desc.info.extent       = {width, height, volume ? depth : 1u};
+	if ((resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa) &&
+	    desc.info.type == Prospero::ImageType::kColor1D) {
+		desc.info.type          = Prospero::ImageType::kColor2D;
+		desc.info.extent.height = 1;
+	} else if ((resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+	            resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
+	           desc.info.type == Prospero::ImageType::kColor1D) {
+		desc.info.type          = Prospero::ImageType::kColor2D;
+		desc.info.extent.height = 1;
+	}
 	desc.info.resources    = {levels, image_layers};
 	desc.info.pitch        = pitch;
 	desc.info.bytes_per_block =
@@ -791,7 +813,7 @@ void RenderExecutor::TrackImageBinding(ImageId id) {
 	}
 }
 
-void RenderExecutor::BindImage(ImageId id, bool storage) {
+void RenderExecutor::BindImage(ImageId id, bool storage, vk::ImageAspectFlags aspect) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
 		return;
@@ -801,6 +823,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
+	image.binding.sampled_aspects |= aspect;
 	TrackImageBinding(id);
 }
 
@@ -819,23 +842,26 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
-PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
-	PreparedBindings prepared;
 	prepared.runtime = &runtime;
+	prepared.images.clear();
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage,
+		          binding.desc.view_info.aspect);
 		prepared.images.push_back(std::move(binding));
 	}
+	prepared.samplers.clear();
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
+	prepared.shader_data.clear();
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -844,7 +870,14 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+	} else {
+		prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	}
+}
+
+PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+	PreparedBindings prepared;
+	PrepareBindings(runtime, prepared);
 	return prepared;
 }
 
@@ -916,16 +949,26 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
+	bool  rebind_needed = true;
+	for (uint32_t iteration = 0; iteration < 4 && rebind_needed; iteration++) {
+		rebind_needed = false;
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto* old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
+			if (old_image != nullptr && old_image->depth_id) {
+				images[i].image_id = old_image->depth_id;
+				old_image          = texture_cache.m_slot_images.try_get(images[i].image_id);
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+			if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+			    old_image->binding.needs_rebind) {
+				if (old_image != nullptr) {
+					old_image->binding = {};
+				}
+				images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				BindImage(images[i].image_id,
+				          images[i].desc.type == TextureCache::BindingType::Storage,
+				          images[i].desc.view_info.aspect);
+				rebind_needed = true;
+			}
 		}
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1051,7 +1094,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                      : vk::AccessFlagBits2::eShaderRead,
 				              range, vk_buffer);
 			} else if (image.binding.is_target) {
-				const auto layout = image.binding.attachment_layout;
+				auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
 				if (image.info.IsDepth()) {
 					const auto host_view =
@@ -1072,7 +1115,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
 					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||
 					    (aspect & vk::ImageAspectFlagBits::eStencil && !stencil_read)) {
-						EXIT("sampling a writable depth/stencil attachment aspect\n");
+						static std::atomic<uint32_t> s_aspect_warn {0};
+						if (s_aspect_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
+							LOGF("sampling a writable depth/stencil attachment aspect (aspect=0x%x layout=%u, promoting to general)\n",
+							     static_cast<uint32_t>(aspect), static_cast<uint32_t>(layout));
+						}
+						layout = vk::ImageLayout::eGeneral;
+						image.binding.attachment_layout = vk::ImageLayout::eGeneral;
 					}
 				}
 				image.Transit(layout,

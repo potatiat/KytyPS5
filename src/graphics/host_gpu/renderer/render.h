@@ -159,6 +159,7 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
 
+	void                           PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -200,7 +201,7 @@ private:
 	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
-	void                      BindImage(ImageId id, bool storage);
+	void                      BindImage(ImageId id, bool storage, vk::ImageAspectFlags aspect = {});
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
@@ -212,6 +213,35 @@ private:
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+public:
+	struct DynamicStateCache {
+		vk::CommandBuffer            last_vk_buffer = nullptr;
+		uint32_t                     viewport_count = 0;
+		std::array<vk::Viewport, 16> viewports {};
+		uint32_t                     scissor_count = 0;
+		std::array<vk::Rect2D, 16>   scissors {};
+		float                        line_width = -1.0f;
+		std::array<float, 4>         blend_constants {-1.0f, -1.0f, -1.0f, -1.0f};
+		int                          depth_test_enable = -1;
+		int                          depth_write_enable = -1;
+		vk::CompareOp                depth_compare_op = vk::CompareOp::eNever;
+		int                          depth_bias_enable = -1;
+		float                        depth_bias_const = -1.0f;
+		float                        depth_bias_clamp = -1.0f;
+		float                        depth_bias_slope = -1.0f;
+		uint32_t                     color_write_count = 0;
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enable {};
+
+		void Invalidate() {
+			last_vk_buffer = nullptr;
+		}
+	};
+
+private:
+	DynamicStateCache                     m_dynamic_state_cache;
+	PreparedBindings                      m_vertex_bindings;
+	PreparedBindings                      m_pixel_bindings;
+	PreparedBindings                      m_compute_bindings;
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
