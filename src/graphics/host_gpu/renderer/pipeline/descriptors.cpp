@@ -337,7 +337,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
+	const auto max_mip = resource.r128 ? descriptor.LastLevel()
+	                                   : std::max<uint8_t>(descriptor.MaxMip(), descriptor.LastLevel());
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
 	        ? descriptor.LastLevel()
@@ -598,7 +599,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto last_level   = descriptor.LastLevel();
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
-	const auto max_mip      = resource.r128 ? last_level : descriptor.MaxMip();
+	const auto max_mip =
+	    resource.r128 ? last_level : std::max<uint8_t>(descriptor.MaxMip(), last_level);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -613,17 +615,36 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
+		if (storage) {
+			EXIT("unsupported storage texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+			     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     base_level, last_level, levels, descriptor.MaxMip(),
+			     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(resource.resource_class),
+			     static_cast<uint32_t>(resource.numeric_class),
+			     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+			     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
+		}
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("TextureCache: unsupported sampled texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+			     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x, falling back to null\n",
+			     base_level, last_level, levels, descriptor.MaxMip(),
+			     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(resource.resource_class),
+			     static_cast<uint32_t>(resource.numeric_class),
+			     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+			     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
+		}
+		auto desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
