@@ -252,6 +252,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";
+	} else {
+		args << "--no-redzone";
 	}
 #endif
 	for (const auto& binding: info.host_input_mapping) {
