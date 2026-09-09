@@ -62,15 +62,29 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+std::string DriverCacheDriverSuffix(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	return fmt::format(":{:08x}:{:08x}:{:08x}:{}\n",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+}
+
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+	constexpr const char* kCacheFormatVersion = "v2";
+	return fmt::format("KytyPC1:{}{}", kCacheFormatVersion, DriverCacheDriverSuffix(properties));
+}
+
+bool IsDriverCacheSignatureCompatible(std::string_view cached_sig,
+                                      const vk::PhysicalDeviceProperties& properties) {
+	if (!cached_sig.starts_with("KytyPC1:")) {
+		return false;
+	}
+	const auto suffix = DriverCacheDriverSuffix(properties);
+	return cached_sig.ends_with(suffix);
 }
 
 std::string PipelineCacheTitleId() {
@@ -641,30 +655,46 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
+		const auto   props     = m_graphics.GetPhysicalDeviceProperties();
+		if (file_size > sizeof(uint64_t) && file_size <= std::numeric_limits<uint32_t>::max()) {
+			std::string cached_signature;
+			char        ch         = 0;
+			uint32_t    read_bytes = 0;
+			while (cached_signature.size() < 256) {
+				file.Read(&ch, 1, &read_bytes);
+				if (read_bytes != 1) {
+					break;
+				}
+				cached_signature.push_back(ch);
+				if (ch == '\n') {
+					break;
+				}
+			}
+			const auto sig_len = cached_signature.size();
+			if (ch == '\n' && file_size >= sig_len + sizeof(uint64_t)) {
+				uint64_t payload_hash = 0;
+				uint32_t hash_read    = 0;
+				uint32_t payload_read = 0;
+				file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
+				const auto payload_size = file_size - sig_len - sizeof(payload_hash);
+				initial_data.resize(payload_size);
+				if (payload_size > 0) {
+					file.Read(initial_data.data(), static_cast<uint32_t>(payload_size), &payload_read);
+				}
+				file.Close();
+				if (hash_read != sizeof(payload_hash) || payload_read != payload_size ||
+				    !IsDriverCacheSignatureCompatible(cached_signature, props) ||
+				    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
+					initial_data.clear();
+					PipelineCacheLog(
+					    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+					    path);
+				} else {
+					loaded_payload_hash = payload_hash;
+				}
 			} else {
-				loaded_payload_hash = payload_hash;
+				file.Close();
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid header)", path);
 			}
 		} else {
 			file.Close();
@@ -1004,8 +1034,7 @@ void PipelineCache::PreloadPipelines() {
 
 	std::string signature(sig_len, '\0');
 	file.Read(signature.data(), sig_len, &bytes_read);
-	const auto expected_sig = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	if (signature != expected_sig) {
+	if (!IsDriverCacheSignatureCompatible(signature, m_graphics.GetPhysicalDeviceProperties())) {
 		file.Close();
 		PipelineCacheLog("Vulkan pipeline cache: manifest signature mismatch; skipping preload");
 		return;
@@ -1125,6 +1154,14 @@ void PipelineCache::PreloadPipelines() {
 	}
 
 	m_compiler_pool.WaitIdle();
+	{
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [id, pipeline]: m_compute_pipelines) {
+			const uint32_t slot =
+			    static_cast<uint32_t>((id ^ (id >> 11u)) & (COMPUTE_FAST_CACHE_SIZE - 1u));
+			m_compute_fast_cache[slot] = {.id = id, .pipeline = pipeline.get()};
+		}
+	}
 	const auto elapsed = Common::Timer::QueryPerformanceCounter() - start_time;
 	const double elapsed_sec =
 	    static_cast<double>(elapsed) / static_cast<double>(Common::Timer::QueryPerformanceFrequency());
@@ -1275,9 +1312,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(ps_active && !pixel_program);
 	const auto color_count = static_cast<uint32_t>(colors.size());
-
-	Common::LockGuard lock(m_mutex);
-	auto&             ctx = command.GetRegisters();
+	auto&      ctx         = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -1419,6 +1454,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		}
 	}
 
+	Common::LockGuard lock(m_mutex);
+
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		for (size_t j = GRAPHICS_MRU_SIZE - 1; j > 0; j--) {
 			m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
@@ -1477,52 +1514,44 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
-	// Fast-path: 16-entry MRU scan (linear search over 256 bytes in L1 cache)
-	for (size_t i = 0; i < COMPUTE_MRU_SIZE; i++) {
-		if (m_compute_mru[i].id == compute_program.id && m_compute_mru[i].pipeline != nullptr) {
-			auto* hit_pipeline = m_compute_mru[i].pipeline;
-			if (i > 0) {
-				auto hit_entry = m_compute_mru[i];
-				for (size_t j = i; j > 0; j--) {
-					m_compute_mru[j] = m_compute_mru[j - 1];
-				}
-				m_compute_mru[0] = hit_entry;
-			}
-			return *hit_pipeline;
-		}
+	const uint64_t id = compute_program.id;
+	const uint32_t slot1 =
+	    static_cast<uint32_t>((id ^ (id >> 11u)) & (COMPUTE_FAST_CACHE_SIZE - 1u));
+	if (m_compute_fast_cache[slot1].id == id && m_compute_fast_cache[slot1].pipeline != nullptr) {
+		return *m_compute_fast_cache[slot1].pipeline;
+	}
+	const uint32_t slot2 = (slot1 + 1u) & (COMPUTE_FAST_CACHE_SIZE - 1u);
+	if (m_compute_fast_cache[slot2].id == id && m_compute_fast_cache[slot2].pipeline != nullptr) {
+		return *m_compute_fast_cache[slot2].pipeline;
 	}
 
 	Common::LockGuard lock(m_mutex);
 
-	if (auto iter = m_compute_pipelines.find(compute_program.id);
-	    iter != m_compute_pipelines.end()) {
-		for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
-			m_compute_mru[j] = m_compute_mru[j - 1];
-		}
-		m_compute_mru[0] = {.id = compute_program.id, .pipeline = iter->second.get()};
-		return *iter->second;
+	if (auto iter = m_compute_pipelines.find(id); iter != m_compute_pipelines.end()) {
+		auto* result = iter->second.get();
+		m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
+		    .id = id, .pipeline = result};
+		return *result;
 	}
 
 	std::shared_ptr<Pipeline> compiled_pipeline;
 
-	auto in_flight = m_in_flight_compute.find(compute_program.id);
+	auto in_flight = m_in_flight_compute.find(id);
 	if (in_flight != m_in_flight_compute.end()) {
 		auto future = in_flight->second;
 		m_mutex.Unlock();
 		compiled_pipeline = future.get();
 		m_mutex.Lock();
 
-		auto existing = m_compute_pipelines.find(compute_program.id);
+		auto existing = m_compute_pipelines.find(id);
 		if (existing != m_compute_pipelines.end()) {
-			m_in_flight_compute.erase(compute_program.id);
+			m_in_flight_compute.erase(id);
 			auto* result_pipeline = existing->second.get();
-			for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
-				m_compute_mru[j] = m_compute_mru[j - 1];
-			}
-			m_compute_mru[0] = {.id = compute_program.id, .pipeline = result_pipeline};
+			m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
+			    .id = id, .pipeline = result_pipeline};
 			return *result_pipeline;
 		}
-		m_in_flight_compute.erase(compute_program.id);
+		m_in_flight_compute.erase(id);
 	} else {
 		if (graphics_debug_dump_enabled()) {
 			ShaderDbgDumpInputInfo(input_info);
@@ -1530,10 +1559,10 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		compiled_pipeline = std::make_shared<Pipeline>();
 		CreatePipelineInternal(m_graphics, *compiled_pipeline, input_info,
 		                       compute_program.module, m_driver_cache);
-		if (!m_manifest_records.contains(compute_program.id) && input_info.stage &&
+		if (!m_manifest_records.contains(id) && input_info.stage &&
 		    input_info.stage.program) {
-			if (const auto* spirv = m_program_cache->GetSpirv(compute_program.id)) {
-				RecordManifestComputeLocked(compute_program.id,
+			if (const auto* spirv = m_program_cache->GetSpirv(id)) {
+				RecordManifestComputeLocked(id,
 				                            input_info.stage.program->wave_size,
 				                            *input_info.stage.program, *spirv);
 			}
@@ -1544,13 +1573,11 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(compiled_pipeline->pipeline_layout == nullptr);
 
 	auto [iter, inserted] =
-	    m_compute_pipelines.emplace(compute_program.id, std::move(compiled_pipeline));
+	    m_compute_pipelines.emplace(id, std::move(compiled_pipeline));
 	auto* result_pipeline = iter->second.get();
 
-	for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
-		m_compute_mru[j] = m_compute_mru[j - 1];
-	}
-	m_compute_mru[0] = {.id = compute_program.id, .pipeline = result_pipeline};
+	m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
+	    .id = id, .pipeline = result_pipeline};
 
 	m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);
 

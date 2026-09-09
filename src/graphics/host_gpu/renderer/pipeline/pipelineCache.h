@@ -248,12 +248,12 @@ private:
 	std::unordered_map<uint64_t, std::shared_future<std::shared_ptr<Pipeline>>>
 	                      m_in_flight_compute;
 	Common::Mutex         m_mutex;
-	struct ComputeMruEntry {
+	struct ComputeFastCacheEntry {
 		uint64_t  id       = 0;
 		Pipeline* pipeline = nullptr;
 	};
-	static constexpr size_t COMPUTE_MRU_SIZE = 16;
-	std::array<ComputeMruEntry, COMPUTE_MRU_SIZE> m_compute_mru {};
+	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = 2048;
+	std::array<ComputeFastCacheEntry, COMPUTE_FAST_CACHE_SIZE> m_compute_fast_cache {};
 
 	struct GraphicsMruEntry {
 		uint64_t            vs_id    = 0;
@@ -261,7 +261,7 @@ private:
 		GraphicsPipelineKey key {};
 		Pipeline*           pipeline = nullptr;
 	};
-	static constexpr size_t GRAPHICS_MRU_SIZE = 16;
+	static constexpr size_t GRAPHICS_MRU_SIZE = 64;
 	std::array<GraphicsMruEntry, GRAPHICS_MRU_SIZE> m_graphics_mru {};
 	std::atomic<uint32_t> m_new_pipelines_since_save {0};
 
