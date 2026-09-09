@@ -1157,9 +1157,17 @@ void PipelineCache::PreloadPipelines() {
 	{
 		Common::LockGuard lock(m_mutex);
 		for (const auto& [id, pipeline]: m_compute_pipelines) {
-			const uint32_t slot =
-			    static_cast<uint32_t>((id ^ (id >> 11u)) & (COMPUTE_FAST_CACHE_SIZE - 1u));
-			m_compute_fast_cache[slot] = {.id = id, .pipeline = pipeline.get()};
+			const uint32_t set =
+			    static_cast<uint32_t>(((id * 0x9E3779B97F4A7C15ull) >> 32) &
+			                          (COMPUTE_FAST_CACHE_SETS - 1u)) *
+			    COMPUTE_FAST_CACHE_WAYS;
+			for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
+				if (m_compute_fast_cache[set + i].pipeline == nullptr ||
+				    m_compute_fast_cache[set + i].id == id) {
+					m_compute_fast_cache[set + i] = {.id = id, .pipeline = pipeline.get()};
+					break;
+				}
+			}
 		}
 	}
 	const auto elapsed = Common::Timer::QueryPerformanceCounter() - start_time;
@@ -1515,22 +1523,35 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_IF(!compute_program);
 
 	const uint64_t id = compute_program.id;
-	const uint32_t slot1 =
-	    static_cast<uint32_t>((id ^ (id >> 11u)) & (COMPUTE_FAST_CACHE_SIZE - 1u));
-	if (m_compute_fast_cache[slot1].id == id && m_compute_fast_cache[slot1].pipeline != nullptr) {
-		return *m_compute_fast_cache[slot1].pipeline;
-	}
-	const uint32_t slot2 = (slot1 + 1u) & (COMPUTE_FAST_CACHE_SIZE - 1u);
-	if (m_compute_fast_cache[slot2].id == id && m_compute_fast_cache[slot2].pipeline != nullptr) {
-		return *m_compute_fast_cache[slot2].pipeline;
+	const uint32_t set =
+	    static_cast<uint32_t>(((id * 0x9E3779B97F4A7C15ull) >> 32) &
+	                          (COMPUTE_FAST_CACHE_SETS - 1u)) *
+	    COMPUTE_FAST_CACHE_WAYS;
+	for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
+		if (m_compute_fast_cache[set + i].id == id && m_compute_fast_cache[set + i].pipeline != nullptr) {
+			return *m_compute_fast_cache[set + i].pipeline;
+		}
 	}
 
 	Common::LockGuard lock(m_mutex);
 
+	auto insert_fast_cache = [this, set, id](Pipeline* pipeline) {
+		for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
+			if (m_compute_fast_cache[set + i].pipeline == nullptr ||
+			    m_compute_fast_cache[set + i].id == id) {
+				m_compute_fast_cache[set + i] = {.id = id, .pipeline = pipeline};
+				return;
+			}
+		}
+		static std::atomic<uint32_t> victim_counter {0};
+		const size_t target_slot =
+		    set + (victim_counter.fetch_add(1, std::memory_order_relaxed) % COMPUTE_FAST_CACHE_WAYS);
+		m_compute_fast_cache[target_slot] = {.id = id, .pipeline = pipeline};
+	};
+
 	if (auto iter = m_compute_pipelines.find(id); iter != m_compute_pipelines.end()) {
 		auto* result = iter->second.get();
-		m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
-		    .id = id, .pipeline = result};
+		insert_fast_cache(result);
 		return *result;
 	}
 
@@ -1547,8 +1568,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		if (existing != m_compute_pipelines.end()) {
 			m_in_flight_compute.erase(id);
 			auto* result_pipeline = existing->second.get();
-			m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
-			    .id = id, .pipeline = result_pipeline};
+			insert_fast_cache(result_pipeline);
 			return *result_pipeline;
 		}
 		m_in_flight_compute.erase(id);
@@ -1576,8 +1596,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	    m_compute_pipelines.emplace(id, std::move(compiled_pipeline));
 	auto* result_pipeline = iter->second.get();
 
-	m_compute_fast_cache[m_compute_fast_cache[slot1].pipeline == nullptr ? slot1 : slot2] = {
-	    .id = id, .pipeline = result_pipeline};
+	insert_fast_cache(result_pipeline);
 
 	m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);
 

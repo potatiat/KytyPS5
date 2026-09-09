@@ -252,7 +252,9 @@ private:
 		uint64_t  id       = 0;
 		Pipeline* pipeline = nullptr;
 	};
-	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = 2048;
+	static constexpr size_t COMPUTE_FAST_CACHE_WAYS = 4;
+	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 4096;
+	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = COMPUTE_FAST_CACHE_SETS * COMPUTE_FAST_CACHE_WAYS;
 	std::array<ComputeFastCacheEntry, COMPUTE_FAST_CACHE_SIZE> m_compute_fast_cache {};
 
 	struct GraphicsMruEntry {
