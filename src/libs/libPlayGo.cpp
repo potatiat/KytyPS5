@@ -381,6 +381,10 @@ int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
 	out_progress->total_size    = number_of_entries;
 	out_progress->progress_size = number_of_entries;
 
+	LOGF("[DBG-s500] PlayGoGetProgress entries=%" PRIu32 " progress_size=%" PRIu64
+	     " total_size=%" PRIu64 "\n",
+	     number_of_entries, out_progress->progress_size, out_progress->total_size);
+
 	return OK;
 }
 

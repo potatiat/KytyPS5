@@ -13,6 +13,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <vector>
@@ -24,8 +25,10 @@ LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
 namespace SaveData {
 
 // TODO(): specify dir at launcher
-static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
-static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
+static constexpr char     SAVE_DATA_DIR[]              = "_SaveData";
+static constexpr char     ALLOCATED_BLOCKS_FILE[]      = ".kyty_allocated_blocks";
+static constexpr uint64_t SAVE_DATA_BLOCK_SIZE         = 32768;
+static constexpr uint64_t SAVE_DATA_BLOCKS_MAX         = 32768;
 
 struct SceSaveDataDirName {
 	char data[32];
@@ -294,11 +297,141 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
+static uint64_t directory_bytes(const std::string& path) {
+	uint64_t total = 0;
+	if (!Common::File::IsDirectoryExisting(path)) {
+		return 0;
+	}
+	for (const auto& entry: Common::File::GetDirEntries(path)) {
+		if (entry.name == "." || entry.name == "..") {
+			continue;
+		}
+		const std::string child = path + "/" + entry.name;
+		if (entry.is_file) {
+			if (entry.name == ALLOCATED_BLOCKS_FILE) {
+				continue;
+			}
+			total += Common::File::Size(child);
+		} else {
+			total += directory_bytes(child);
+		}
+	}
+	return total;
+}
+
+static uint64_t used_blocks_from_bytes(uint64_t bytes) {
+	if (bytes == 0) {
+		return 0;
+	}
+	return (bytes + SAVE_DATA_BLOCK_SIZE - 1u) / SAVE_DATA_BLOCK_SIZE;
+}
+
+static void persist_allocated_blocks(const std::string& mount_dir, uint64_t blocks) {
+	if (blocks == 0 || !Common::File::IsDirectoryExisting(mount_dir)) {
+		return;
+	}
+	Common::File file;
+	if (!file.Create(mount_dir + "/" + ALLOCATED_BLOCKS_FILE)) {
+		return;
+	}
+	char buf[32] {};
+	const int n = std::snprintf(buf, sizeof(buf), "%" PRIu64, blocks);
+	if (n > 0) {
+		file.Write(buf, static_cast<uint32_t>(n));
+	}
+	file.Close();
+}
+
+static uint64_t load_allocated_blocks(const std::string& mount_dir) {
+	const std::string path = mount_dir + "/" + ALLOCATED_BLOCKS_FILE;
+	if (!Common::File::IsFileExisting(path)) {
+		return 0;
+	}
+	Common::File file;
+	if (!file.Open(path, Common::File::Mode::Read)) {
+		return 0;
+	}
+	char     buf[32] {};
+	uint32_t n = 0;
+	file.Read(buf, sizeof(buf) - 1, &n);
+	file.Close();
+	if (n == 0) {
+		return 0;
+	}
+	return std::strtoull(buf, nullptr, 10);
+}
+
+static std::string host_path_for_mount(const SaveDataMountPoint* mount_point) {
+	if (mount_point == nullptr) {
+		return {};
+	}
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return {};
+	}
+	const auto* mounted = g_mount_slots.Get(static_cast<size_t>(slot));
+	return (mounted != nullptr ? mounted->host_path : std::string());
+}
+
+static std::string sce_sys_path(const std::string& mount_dir, const char* name) {
+	return mount_dir + "/sce_sys/" + name;
+}
+
+static bool read_param_file(const std::string& mount_dir, SaveDataParam* out) {
+	if (mount_dir.empty() || out == nullptr) {
+		return false;
+	}
+	const std::string path = sce_sys_path(mount_dir, "param.bin");
+	if (!Common::File::IsFileExisting(path)) {
+		return false;
+	}
+	Common::File file;
+	if (!file.Open(path, Common::File::Mode::Read)) {
+		return false;
+	}
+	*out         = {};
+	uint32_t n = 0;
+	file.Read(out, sizeof(SaveDataParam), &n);
+	file.Close();
+	return n != 0;
+}
+
+static bool write_mount_file(const std::string& mount_dir, const char* name, const void* data,
+                             size_t size) {
+	if (mount_dir.empty() || data == nullptr || size == 0) {
+		return false;
+	}
+	Common::File::CreateDirectories(mount_dir + "/sce_sys");
+	Common::File file;
+	if (!file.Create(sce_sys_path(mount_dir, name))) {
+		return false;
+	}
+	file.Write(data, static_cast<uint32_t>(size));
+	file.Close();
+	return true;
+}
+
+static uint64_t resolve_allocated_blocks(const std::string& mount_dir, uint64_t requested) {
+	if (requested != 0 && requested != static_cast<uint64_t>(-1)) {
+		if (requested > SAVE_DATA_BLOCKS_MAX) {
+			requested = SAVE_DATA_BLOCKS_MAX;
+		}
+		persist_allocated_blocks(mount_dir, requested);
+		return requested;
+	}
+	const uint64_t persisted = load_allocated_blocks(mount_dir);
+	if (persisted != 0) {
+		return persisted;
+	}
+	return used_blocks_from_bytes(directory_bytes(mount_dir));
+}
+
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
-                           uint32_t status, SaveDataMountResult* result) {
+                           uint64_t allocated_blocks, uint32_t status,
+                           SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
 	LibKernel::FileSystem::Mount(directory, mount_point);
-	g_mount_slots.Mount(static_cast<size_t>(slot), dir_name);
+	g_mount_slots.Mount(static_cast<size_t>(slot), dir_name, directory, allocated_blocks);
 	std::snprintf(result->mount_point.data, sizeof(result->mount_point.data), "%s",
 	              mount_point.c_str());
 	result->required_blocks = 0;
@@ -307,9 +440,11 @@ static int mount_save_data(int slot, std::string_view dir_name, const std::strin
 }
 
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(init != nullptr);
+	LOGF("[DBG-s500] SaveDataInitialize3\n");
 
 	return OK;
 }
@@ -327,11 +462,14 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 }
 
 int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
+	const int resource = g_next_transaction_resource++;
+	LOGF("[DBG-s500] CreateTransactionResource size=%" PRIu32 " resource=%d\n", size, resource);
 	LOGF("\t size = %" PRIu32 "\n", size);
 
-	return g_next_transaction_resource++;
+	return resource;
 }
 
 int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
@@ -344,6 +482,7 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 
 int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
                                         SaveDataDirNameSearchResult*     result) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
 	if (cond == nullptr || result == nullptr ||
@@ -405,28 +544,50 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	result->set_num = static_cast<uint32_t>(max_count);
 
 	for (size_t i = 0; i < max_count; i++) {
+		const std::string dir_path = root + "/" + dir_list[i];
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
 			result->params[i] = {};
+			if (read_param_file(dir_path, &result->params[i])) {
+				LOGF("[DBG-s500] DirNameSearch [%zu] %s param title=%s user_param=%u\n", i,
+				     dir_list[i].c_str(), result->params[i].title, result->params[i].user_param);
+			}
 		}
 		if (result->infos != nullptr) {
+			const uint64_t    used       = used_blocks_from_bytes(directory_bytes(dir_path));
+			const uint64_t    persisted  = load_allocated_blocks(dir_path);
+			const uint64_t    allocated  = (persisted != 0 ? persisted : (used != 0 ? used : 1));
 			result->infos[i]             = {};
-			result->infos[i].blocks      = SAVE_DATA_BLOCKS_MAX;
-			result->infos[i].free_blocks = SAVE_DATA_BLOCKS_MAX;
+			result->infos[i].blocks      = allocated;
+			result->infos[i].free_blocks = (allocated > used ? allocated - used : 0);
+			LOGF("\t [%zu] %s blocks=%" PRIu64 " free_blocks=%" PRIu64 "\n", i,
+			     dir_list[i].c_str(), result->infos[i].blocks, result->infos[i].free_blocks);
+			LOGF("[DBG-s500] DirNameSearch [%zu] %s blocks=%" PRIu64 " free_blocks=%" PRIu64 "\n",
+			     i, dir_list[i].c_str(), result->infos[i].blocks, result->infos[i].free_blocks);
 		}
 	}
+
+	LOGF("\t hit_num = %" PRIu32 " set_num = %" PRIu32 "\n", result->hit_num, result->set_num);
+	LOGF("[DBG-s500] DirNameSearch dir=%s hit_num=%" PRIu32 " set_num=%" PRIu32 "\n",
+	     cond->dir_name != nullptr ? cond->dir_name->data : "<all>", result->hit_num,
+	     result->set_num);
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(mount == nullptr);
 	EXIT_NOT_IMPLEMENTED(mount_result == nullptr);
 	EXIT_NOT_IMPLEMENTED(mount->dir_name == nullptr);
 
+	LOGF("[DBG-s500] Mount3 dir=%s blocks=%" PRIu64 " system_blocks=%" PRIu64 " mode=%" PRIu32
+	     " resource=%" PRId32 "\n",
+	     mount->dir_name->data, mount->blocks, mount->system_blocks, mount->mount_mode,
+	     mount->resource);
 	LOGF("\t user_id       = %d\n"
 	     "\t dir_name      = %s\n"
 	     "\t blocks        = %" PRIu64 "\n"
@@ -474,7 +635,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	const uint64_t allocated = resolve_allocated_blocks(mount_dir, mount->blocks);
+	LOGF("[DBG-s500] Mount3 resolved allocated=%" PRIu64 " created=%d\n", allocated,
+	     created ? 1 : 0);
+	return mount_save_data(slot, dir_name, mount_dir, allocated, created ? 1u : 0u, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -611,10 +775,12 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 		Common::File::CreateDirectories(mount_dir);
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, 1, mount_result);
+	const uint64_t allocated = resolve_allocated_blocks(mount_dir, 0);
+	return mount_save_data(slot, dir_name, mount_dir, allocated, 1, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
 	if (mount_point == nullptr) {
@@ -715,6 +881,15 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		Common::LockGuard lock(g_mount_mutex);
+		const std::string host = host_path_for_mount(mount_point);
+		if (read_param_file(host, static_cast<SaveDataParam*>(param_buf))) {
+			LOGF("[DBG-s500] GetParam type=0 host=%s title=%s\n", host.c_str(),
+			     static_cast<SaveDataParam*>(param_buf)->title);
+		} else {
+			LOGF("[DBG-s500] GetParam type=0 host=%s missing param.bin\n",
+			     host.empty() ? "<none>" : host.c_str());
+		}
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -742,6 +917,22 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 	     mount_point->data, reinterpret_cast<uint64_t>(icon->buf), icon->buf_size);
 
 	icon->data_size = 0;
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string host = host_path_for_mount(mount_point);
+	const std::string path = sce_sys_path(host, "icon0.png");
+	if (icon->buf != nullptr && icon->buf_size != 0 && !host.empty() &&
+	    Common::File::IsFileExisting(path)) {
+		Common::File file;
+		if (file.Open(path, Common::File::Mode::Read)) {
+			const auto n = static_cast<uint32_t>(
+			    std::min(icon->buf_size, static_cast<size_t>(file.Size())));
+			file.Read(icon->buf, n);
+			icon->data_size = n;
+			file.Close();
+		}
+	}
+	LOGF("[DBG-s500] LoadIcon host=%s data_size=%" PRIu64 "\n",
+	     host.empty() ? "<none>" : host.c_str(), icon->data_size);
 
 	return OK;
 }
@@ -829,7 +1020,17 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string host = host_path_for_mount(mount_point);
+	if (host.empty()) {
+		LOGF("[DBG-s500] SetParam NOT_MOUNTED mount_point=%s\n", mount_point->data);
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+
 	if (param_type == 0) {
+		if (param_buf == nullptr || param_buf_size < sizeof(SaveDataParam)) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
 		const auto* p = static_cast<const SaveDataParam*>(param_buf);
 
 		LOGF("\t title      = %s\n"
@@ -837,6 +1038,8 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+		write_mount_file(host, "param.bin", p, sizeof(SaveDataParam));
+		LOGF("[DBG-s500] SetParam wrote param.bin host=%s\n", host.c_str());
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}
@@ -846,28 +1049,65 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 
 int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
                                        SaveDataMountInfo*        info) {
+	PRINT_NAME_ENABLE(true);
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	*info = {};
+	Common::LockGuard lock(g_mount_mutex);
+	const int         slot = g_mount_slots.Find(mount_point->data);
+	const auto*       mounted = (slot == SaveDataMountSlots::FULL ? nullptr : g_mount_slots.Get(
+	                               static_cast<size_t>(slot)));
 
-	info->blocks      = SAVE_DATA_BLOCKS_MAX;
-	info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+	if (mounted == nullptr) {
+		LOGF("[DBG-s500] GetMountInfo mount_point=%s slot=%d NOT_MOUNTED\n", mount_point->data,
+		     slot);
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+
+	const uint64_t used =
+	    used_blocks_from_bytes(directory_bytes(mounted->host_path));
+	uint64_t allocated = mounted->allocated_blocks;
+	if (allocated == 0) {
+		allocated = (used != 0 ? used : 1);
+	}
+
+	*info             = {};
+	info->blocks      = allocated;
+	info->free_blocks = (allocated > used ? allocated - used : 0);
+
+	LOGF("[DBG-s500] GetMountInfo mount_point=%s dir=%s allocated=%" PRIu64 " used=%" PRIu64
+	     " free=%" PRIu64 "\n",
+	     mount_point->data, mounted->directory->c_str(), info->blocks, used, info->free_blocks);
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
                                    const SaveDataIcon*       icon) {
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
-	EXIT_NOT_IMPLEMENTED(icon == nullptr);
+	PRINT_NAME();
+	if (mount_point == nullptr || icon == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
 
 	LOGF("\t buf       = %016" PRIx64 "\n"
 	     "\t buf_size  = %" PRIu64 "\n"
 	     "\t data_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(icon->buf), icon->buf_size, icon->data_size);
+
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string host = host_path_for_mount(mount_point);
+	if (host.empty()) {
+		LOGF("[DBG-s500] SaveIcon NOT_MOUNTED mount_point=%s\n", mount_point->data);
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	const size_t n = (icon->data_size != 0 ? icon->data_size : icon->buf_size);
+	if (icon->buf != nullptr && n != 0) {
+		write_mount_file(host, "icon0.png", icon->buf, n);
+	}
+	LOGF("[DBG-s500] SaveIcon wrote icon0.png host=%s bytes=%" PRIu64 "\n", host.c_str(),
+	     static_cast<uint64_t>(n));
 
 	return OK;
 }
