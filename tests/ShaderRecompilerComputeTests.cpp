@@ -4488,6 +4488,7 @@ public:
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
+    context.ShutdownGpu();
 
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,

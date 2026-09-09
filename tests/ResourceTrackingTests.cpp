@@ -450,12 +450,17 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed indirect image pattern was partially accepted");
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-  BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
-             "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+  wrapped_immediate->PlanAndTrack();
+  Check(wrapped_immediate->program.resource_tracking_complete &&
+            !wrapped_immediate->program.info.images.empty(),
+        "instruction-offset material key was not tracked as an indirect image");
+  const auto wrapped_source = wrapped_immediate->program.info.images[0].source;
+  Check(wrapped_source < wrapped_immediate->program.descriptor_sources.size() &&
+            wrapped_immediate->program.descriptor_sources[wrapped_source]
+                .indirect_image.has_value() &&
+            wrapped_immediate->program.descriptor_sources[wrapped_source]
+                    .indirect_image->selector_offset == 8u,
+        "instruction offset 4 was not folded into the material selector");
 }
 
 void TestComputeBufferFill() {
@@ -1287,7 +1292,7 @@ struct WaterfallFixture {
   WaterfallFixture(uint32_t one = 1u, uint32_t lane_mask = 31u,
                    ValueOpcode clear = ValueOpcode::BitwiseXor32,
                    bool entry_in_loop = false, bool body = true,
-                   bool ballot_from_key = true) {
+                   bool ballot_from_key = true, bool andn = false) {
     auto *entry_block = fixture.block;
     auto *loop = fixture.AddBlock();
     entry_block->AddBranch(loop);
@@ -1310,7 +1315,12 @@ struct WaterfallFixture {
                                      {lsb, Value(lane_mask)}, 0, loop);
     const auto stepped = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
                                       {Value(one), masked}, 0, loop);
-    const auto cleared = fixture.Emit(clear, {stepped, mask}, 0, loop);
+    const auto cleared =
+        andn ? fixture.Emit(ValueOpcode::BitwiseAnd32,
+                            {mask, fixture.Emit(ValueOpcode::BitwiseNot32,
+                                                {stepped}, 0, loop)},
+                            0, loop)
+             : fixture.Emit(clear, {stepped, mask}, 0, loop);
     if (body) {
       fixture.Emit(ValueOpcode::IEqual32, {lsb, key}, 0, loop);
       const auto scaled = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
@@ -1446,6 +1456,139 @@ void TestDenseIndirectImageMaterialization() {
   Check(!MaterializeResources(unreadable_plan, runtime, snapshot,
                               specialization),
         "dense indirect image accepted a table it could not read");
+}
+
+void TestDenseIndirectImagePromotes2DIntoArraySample() {
+  Fixture fixture;
+  const auto low = fixture.UserData(0);
+  const auto high = fixture.UserData(1);
+  const auto image_handle = fixture.Image({low, high, Value(0u), Value(0u),
+                                           Value(0u), Value(0u), Value(0u),
+                                           Value(0u)},
+                                          0x158);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2DArray;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image_handle, fixture.Sampler({Value(0u), Value(0u), Value(0u),
+                                               Value(0u)},
+                                              0x158),
+                fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x158));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1 &&
+            fixture.program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2DArray,
+        "2D-array sample was not tracked as a 2D-array image");
+
+  constexpr uint32_t kEntries = 4;
+  constexpr uint32_t kTable = 0x158;
+  auto &source = fixture.program
+                     .descriptor_sources[fixture.program.info.images[0].source];
+  source.dword_count = 2;
+  source.dwords = {low, high};
+  source.indirect_image = DescriptorSource::IndirectImage{
+      .heap_source = fixture.program.info.images[0].source,
+      .table_offset = kTable,
+      .key_bound = kEntries};
+
+  using ImageType = Libs::Graphics::Prospero::ImageType;
+  const auto WriteDescriptor = [](LinearTestMemory &memory, uint32_t entry,
+                                  ImageType type, uint32_t base) {
+    std::array<uint32_t, 8> descriptor{};
+    descriptor[0] = base;
+    descriptor[1] = static_cast<uint32_t>(
+                        Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm)
+                    << 20u;
+    descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+                    (static_cast<uint32_t>(type) << 28u);
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[(kTable + entry * 32u) / 4u + dword] = descriptor[dword];
+    }
+  };
+
+  LinearTestMemory memory_image;
+  WriteDescriptor(memory_image, 0, ImageType::kColor2DArray, 0x40u);
+  WriteDescriptor(memory_image, 1, ImageType::kColor2DArray, 0x41u);
+  WriteDescriptor(memory_image, 2, ImageType::kColor2D, 0x42u);
+  WriteDescriptor(memory_image, 3, ImageType::kColor3D, 0x43u);
+
+  const std::array<uint32_t, 2> user_data{
+      static_cast<uint32_t>(memory_image.base), 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory_image,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  MaterializeReport report;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization,
+                             &report),
+        "mixed 2D / 2D-array dense table did not materialize");
+  Check(report.dropped_candidates == 1u && report.dropped_shapes == 1u,
+        "2D descriptors sampled as 2D-array were dropped instead of promoted");
+  Check(specialization.images.size() == kEntries &&
+            snapshot.images.size() == kEntries,
+        "mixed dense table did not keep one candidate per key");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto candidate_of = [&](uint32_t key) {
+    const auto offset = mapping + 1u + key * 2u;
+    return snapshot.images[snapshot.flattened_srt[offset + 1u]];
+  };
+  Check(candidate_of(2u).dwords[0] == 0x42u,
+        "the 2D albedo slot in a 2D-array sample table was zeroed");
+  Check(std::ranges::all_of(candidate_of(3u).dwords,
+                            [](uint32_t dword) { return dword == 0u; }),
+        "an incompatible 3D slot was kept in a 2D-array sample table");
+  for (uint32_t index = 0; index < specialization.images.size(); index++) {
+    Check(specialization.images[index].dimension ==
+              Decoder::ImageDimension::Dim2DArray,
+          "promoted mixed table did not specialize as 2D-array");
+  }
+}
+
+void TestStorage2DWriteKeepsGuestTypeWhenIsaIsArray() {
+  Fixture fixture;
+  std::array<Value, 8> image_words;
+  for (uint32_t index = 0; index < image_words.size(); index++) {
+    image_words[index] = fixture.UserData(index);
+  }
+  const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                 {Value(1u), Value(2u), Value(3u), Value(4u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2DArray;
+  fixture.Emit(ValueOpcode::ImageWrite,
+               {fixture.Image(image_words, 0x40), fixture.ImageAddress(), data,
+                Value(true)},
+               fixture.AddMemory(memory, 0x40));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1 &&
+            fixture.program.info.images[0].resource_class ==
+                ImageResourceClass::Storage &&
+            fixture.program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2DArray &&
+            fixture.program.info.images[0].written,
+        "2D-array IMAGE_STORE was not tracked as a storage 2D-array");
+
+  std::array<uint32_t, 8> user_data{};
+  user_data[0] = 0x1000u;
+  user_data[1] = static_cast<uint32_t>(
+                     Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm)
+                 << 20u;
+  user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::ImageType::kColor2D)
+                  << 28u);
+  SrtRuntime runtime{.user_data = user_data};
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "storage 2D UAV sampled as 2D-array ISA did not materialize");
+  Check(specialization.images.size() == 1 &&
+            specialization.images[0].dimension == Decoder::ImageDimension::Dim2D,
+        "storage 2D UAV was promoted to an unsupported 2D-array");
 }
 
 void TestLoopBoundedDenseIndirectImage() {
@@ -1743,10 +1886,74 @@ void TestReadLaneProbeIndirectImage() {
   }
 }
 
+void PlanDenseShiftedAddressTable(bool split_offsets, uint32_t imm_base, uint32_t expected_table,
+                                  bool per_lane_key, const char *label) {
+  Fixture fixture(ShaderType::Pixel);
+  const auto pred =
+      fixture.Emit(ValueOpcode::IEqual32, {Value(1u), Value(1u)});
+  const auto raw_key = fixture.UserData(4);
+  const auto key =
+      per_lane_key
+          ? fixture.Emit(ValueOpcode::SelectU32, {pred, raw_key, Value(0u)})
+          : raw_key;
+  fixture.Emit(ValueOpcode::ULessThan32, {key, Value(32u)});
+  const auto scaled =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  const auto address =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 0xfc);
+  std::array<Value, 8> dwords{};
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = split_offsets ? imm_base + index * sizeof(uint32_t) : imm_base;
+    word.component_index = index;
+    word.component_count = 8u;
+    dwords[index] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, scaled, Value(0u), Value(true)},
+        fixture.AddMemory(word, 0xfc));
+  }
+  const auto image = fixture.Image(dwords, 0xfc);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image,
+                fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)},
+                                0xfc),
+                fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0xfc));
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete &&
+            fixture.program.info.images.size() == 1,
+        label);
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->table_offset == expected_table &&
+            source.indirect_image->key_bound == 32u,
+        label);
+}
+
+void TestDenseShiftedAddressTable() {
+  PlanDenseShiftedAddressTable(true, 0u, 0u, true,
+                               "per-lane key<<5 with split dword offsets was not planned");
+  PlanDenseShiftedAddressTable(false, 0u, 0u, true,
+                               "per-lane key<<5 with shared SMEM offset was not planned");
+  PlanDenseShiftedAddressTable(true, 0x40u, 0x40u, false,
+                               "key<<5 with SMEM immediate 0x40 was not planned");
+  PlanDenseShiftedAddressTable(false, 0x40u, 0x40u, true,
+                               "per-lane key<<5 with shared SMEM immediate 0x40 was not planned");
+}
+
 void TestWaterfallDescriptorMatch() {
   WaterfallFixture built;
   const auto matches = FindWaterfallDescriptors(built.fixture.program);
   Check(matches.size() == 1, "waterfall descriptor loop was not matched");
+  WaterfallFixture andn(1u, 31u, ValueOpcode::BitwiseXor32, false, true, true,
+                        true);
+  Check(FindWaterfallDescriptors(andn.fixture.program).size() == 1,
+        "ANDN mask walk was not matched as a waterfall");
   Check(matches[0].mask_phi == built.phi &&
             matches[0].index->GetOpcode() == ValueOpcode::FindILsb32 &&
             matches[0].entry.Resolve() == built.entry.Resolve(),
@@ -1759,9 +1966,179 @@ void TestWaterfallDescriptorMatch() {
         "waterfall descriptor table was extracted incorrectly");
 }
 
+void TestWaterfallZeroBaseTable() {
+  Fixture fixture(ShaderType::Pixel);
+  auto *entry_block = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry_block->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  const auto key = fixture.UserData(4);
+  const auto key_bits =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)});
+  const auto bit =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(1u), key_bits});
+  const auto low = fixture.Emit(ValueOpcode::ReadLane, {bit, Value(31u)});
+  const auto high = fixture.Emit(ValueOpcode::ReadLane, {bit, Value(63u)});
+  const auto ballot = fixture.Emit(ValueOpcode::BitwiseOr32, {low, high});
+
+  auto *phi = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U32));
+  const auto mask = Value(phi);
+  const auto lsb = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, loop);
+  const auto masked =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {lsb, Value(31u)}, 0, loop);
+  const auto stepped = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {Value(1u), masked}, 0, loop);
+  const auto inverted =
+      fixture.Emit(ValueOpcode::BitwiseNot32, {stepped}, 0, loop);
+  const auto cleared =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, inverted}, 0, loop);
+  fixture.Emit(ValueOpcode::IEqual32, {lsb, key}, 0, loop);
+  const auto scaled = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                   {lsb, Value(5u)}, 0, loop);
+  std::array<Value, 8> dwords{};
+  const auto address =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 0xfc);
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = index * sizeof(uint32_t);
+    dwords[index] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, scaled, Value(0u), Value(true)},
+        fixture.AddMemory(word, 0xfc), loop);
+  }
+  const auto image = fixture.Emit(
+      ValueOpcode::GetImageResource,
+      {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4], dwords[5],
+       dwords[6], dwords[7]},
+      MemoryFlags{0, 0xfc}, loop);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0xfc);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0xfc), loop);
+  phi->AddPhiOperand(entry_block, ballot);
+  phi->AddPhiOperand(loop, cleared);
+
+  const auto matches = FindWaterfallDescriptors(fixture.program);
+  Check(matches.size() == 1 && matches[0].table_offset == 0u &&
+            matches[0].handle != nullptr,
+        "lsb<<5 table with no added base was not matched as a waterfall");
+  Check(RewriteWaterfallDescriptors(fixture.program) == 1,
+        "zero-base waterfall was not rewritten");
+  Check(scaled.Resolve().TryInstruction()->Arg(0).Resolve() == key.Resolve(),
+        "zero-base rewrite did not replace lsb with the material key");
+  bool bounded = false;
+  for (auto *block : fixture.program.blocks) {
+    for (auto &inst : *block) {
+      bounded = bounded || (inst.GetOpcode() == ValueOpcode::ULessThan32 &&
+                            inst.Arg(0).Resolve() == key.Resolve() &&
+                            inst.Arg(1).Resolve().IsImmediate() &&
+                            inst.Arg(1).Resolve().U32() == 32u);
+    }
+  }
+  Check(bounded, "zero-base rewrite did not bound the key to 32");
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete &&
+            fixture.program.info.images.size() == 1,
+        "zero-base waterfall image was not tracked after rewrite");
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->table_offset == 0u &&
+            source.indirect_image->key_bound == 32u,
+        "zero-base waterfall was not planned as a dense table at offset 0");
+}
+
+void TestWaterfallReadFirstLane() {
+  Fixture fixture(ShaderType::Compute);
+  auto *entry_block = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry_block->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  const auto key = fixture.UserData(4);
+  const auto entry_mask = Value(true);
+
+  auto *phi = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U1));
+  const auto mask = Value(phi);
+  const auto rfl = fixture.Emit(ValueOpcode::ReadFirstLane, {key, mask}, 0, loop);
+  const auto compare = fixture.Emit(ValueOpcode::IEqual32, {rfl, key}, 0, loop);
+  const auto matched = fixture.Emit(ValueOpcode::LogicalAnd, {mask, compare}, 0, loop);
+  const auto not_matched = fixture.Emit(ValueOpcode::LogicalNot, {matched}, 0, loop);
+  const auto cleared = fixture.Emit(ValueOpcode::LogicalAnd, {mask, not_matched}, 0, loop);
+
+  const auto scaled = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                   {rfl, Value(5u)}, 0, loop);
+  std::array<Value, 8> dwords{};
+  const auto address =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x1aec);
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = 0x20e0u + index * sizeof(uint32_t);
+    dwords[index] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, scaled, Value(0u), Value(true)},
+        fixture.AddMemory(word, 0x1aec), loop);
+  }
+  const auto image = fixture.Emit(
+      ValueOpcode::GetImageResource,
+      {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4], dwords[5],
+       dwords[6], dwords[7]},
+      MemoryFlags{0, 0x1aec}, loop);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x1aec);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0x1aec), loop);
+  phi->AddPhiOperand(entry_block, entry_mask);
+  phi->AddPhiOperand(loop, cleared);
+
+  const auto matches = FindWaterfallDescriptors(fixture.program);
+  Check(matches.size() == 1 && matches[0].table_offset == 0u &&
+            matches[0].handle != nullptr && matches[0].key.Resolve() == key.Resolve(),
+        "ReadFirstLane loop was not matched as a waterfall");
+  Check(RewriteWaterfallDescriptors(fixture.program) == 1,
+        "ReadFirstLane waterfall was not rewritten");
+  Check(FindWaterfallDescriptors(fixture.program).empty(),
+        "ReadFirstLane waterfall matches again after rewrite");
+  Check(scaled.Resolve().TryInstruction()->Arg(0).Resolve() == key.Resolve(),
+        "ReadFirstLane rewrite did not replace rfl with key");
+  bool bounded = false;
+  for (auto *block : fixture.program.blocks) {
+    for (auto &inst : *block) {
+      bounded = bounded || (inst.GetOpcode() == ValueOpcode::ULessThan32 &&
+                            inst.Arg(0).Resolve() == key.Resolve() &&
+                            inst.Arg(1).Resolve().IsImmediate() &&
+                            inst.Arg(1).Resolve().U32() == 64u);
+    }
+  }
+  Check(bounded, "ReadFirstLane rewrite did not bound the key to 64");
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete &&
+            fixture.program.info.images.size() == 1,
+        "ReadFirstLane waterfall image was not tracked after rewrite");
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->table_offset == 0x20e0u &&
+            source.indirect_image->key_bound == 64u,
+        "ReadFirstLane waterfall was not planned as a dense table at offset 0x20e0");
+}
+
 void TestWaterfallNearMissesRejected() {
-  Check(FindWaterfallDescriptors(WaterfallFixture(1u, 63u).fixture.program).empty(),
-        "a 64-lane mask walk was matched as a waterfall");
+  Check(FindWaterfallDescriptors(WaterfallFixture(1u, 63u).fixture.program).size() == 1,
+        "a 64-lane mask walk was not matched as a waterfall");
   Check(FindWaterfallDescriptors(WaterfallFixture(2u, 31u).fixture.program).empty(),
         "a shifted-by-two mask walk was matched as a waterfall");
   Check(FindWaterfallDescriptors(
@@ -1856,6 +2233,74 @@ void TestWaterfallRewriteDescalarizes() {
         "rewritten waterfall mask does not run exactly one iteration");
   Check(!built.entry.Resolve().TryInstruction()->HasUses(),
         "rewritten waterfall still keeps the ballot alive");
+  WaterfallFixture andn(1u, 31u, ValueOpcode::BitwiseXor32, false, true, true,
+                        true);
+  Check(RewriteWaterfallDescriptors(andn.fixture.program) == 1,
+        "ANDN waterfall loop was not rewritten");
+}
+
+void TestNestedAndnMaskAsImage() {
+  Fixture fixture(ShaderType::Pixel);
+  auto *entry_block = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry_block->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  const auto key = fixture.UserData(4);
+  const auto key_bits =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)});
+  const auto bit =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(1u), key_bits});
+  const auto low = fixture.Emit(ValueOpcode::ReadLane, {bit, Value(31u)});
+  const auto high = fixture.Emit(ValueOpcode::ReadLane, {bit, Value(63u)});
+  const auto ballot = fixture.Emit(ValueOpcode::BitwiseOr32, {low, high});
+
+  auto *inner = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+  const auto inner_mask = Value(inner);
+  const auto lsb =
+      fixture.Emit(ValueOpcode::FindILsb32, {inner_mask}, 0, loop);
+  const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                   {lsb, Value(31u)}, 0, loop);
+  const auto stepped = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {Value(1u), masked}, 0, loop);
+  const auto inverted =
+      fixture.Emit(ValueOpcode::BitwiseNot32, {stepped}, 0, loop);
+  const auto inner_cleared = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                          {inner_mask, inverted}, 0, loop);
+  inner->AddPhiOperand(entry_block, ballot);
+  inner->AddPhiOperand(loop, inner_cleared);
+
+  auto *outer = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+  const auto outer_cleared = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                          {inner_mask, inverted}, 0, loop);
+  outer->AddPhiOperand(entry_block, ballot);
+  outer->AddPhiOperand(loop, outer_cleared);
+
+  std::array<Value, 8> dwords{};
+  dwords[0] = Value(outer);
+  for (uint32_t index = 1; index < dwords.size(); index++) {
+    dwords[index] = fixture.UserData(index);
+  }
+  const auto image = fixture.Image(dwords, 0xfc);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0xfc);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0xfc), loop);
+
+  Check(FindWaterfallDescriptors(fixture.program).size() >= 1,
+        "nested ANDN mask used as an image was not matched");
+  Check(RewriteWaterfallDescriptors(fixture.program) >= 1,
+        "nested ANDN mask used as an image was not rewritten");
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete &&
+            !fixture.program.info.images.empty(),
+        "nested ANDN image mask was not tracked after rewrite");
 }
 
 void TestLoopCycleEnteredThroughRuntimeValue() {
@@ -2516,11 +2961,19 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("dense indirect images", TestDenseIndirectImageMaterialization);
+    Run("dense 2D promoted into 2D-array samples",
+        TestDenseIndirectImagePromotes2DIntoArraySample);
+    Run("storage 2D write keeps guest type",
+        TestStorage2DWriteKeepsGuestTypeWhenIsaIsArray);
     Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
     Run("readlane probe images", TestReadLaneProbeIndirectImage);
+    Run("dense shifted address tables", TestDenseShiftedAddressTable);
     Run("waterfall descriptor match", TestWaterfallDescriptorMatch);
+    Run("waterfall zero-base table", TestWaterfallZeroBaseTable);
+    Run("waterfall readfirstlane table", TestWaterfallReadFirstLane);
     Run("waterfall near misses", TestWaterfallNearMissesRejected);
     Run("waterfall rewrite", TestWaterfallRewriteDescalarizes);
+    Run("nested ANDN image mask", TestNestedAndnMaskAsImage);
     Run("null descriptor path", TestNullDescriptorPathCollapse);
     Run("mixed null descriptor paths", TestMixedNullDescriptorPathsRejected);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
