@@ -54,6 +54,16 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept {
+		auto* image = m_slot_images.try_get(id);
+		if (image != nullptr) {
+			TouchImage(*image);
+		}
+		return image;
+	}
+	[[nodiscard]] const Image*  TryGetImage(ImageId id) const noexcept {
+		return m_slot_images.try_get(id);
+	}
 	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

@@ -41,6 +41,10 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+	[[nodiscard]] Buffer*  TryGetBuffer(BufferId id) noexcept { return m_slot_buffers.try_get(id); }
+	[[nodiscard]] const Buffer* TryGetBuffer(BufferId id) const noexcept {
+		return m_slot_buffers.try_get(id);
+	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,

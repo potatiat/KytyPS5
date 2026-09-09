@@ -912,9 +912,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		auto& src = prepared.buffer_sources[i];
-		if (src.address == address && src.size == size && src.id &&
-		    cache.GetBuffer(src.id).IsInBounds(address, size)) {
-			continue;
+		if (src.address == address && src.size == size && src.id) {
+			const auto* buf = cache.TryGetBuffer(src.id);
+			if (buf != nullptr && !buf->is_deleted && buf->IsInBounds(address, size)) {
+				continue;
+			}
 		}
 		src = {address, size, cache.FindBuffer(address, size)};
 	}
