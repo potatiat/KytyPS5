@@ -398,10 +398,19 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		uint64_t shader_id =
+		    XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+		shader_id ^= (static_cast<uint64_t>(options.stage) << 60);
+		if (shader_id == 0) {
+			shader_id = 1;
+		}
+		if (options.stage == ShaderType::Compute) {
+			compute_spirv[shader_id] = result.spirv;
+		}
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = shader_id, .module = module},
 		};
 	}
 
@@ -561,10 +570,16 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_map<uint64_t, std::vector<uint32_t>>         compute_spirv;
 	ProgramKey                                                  lookup_key;
 	ShaderGuestReadCache                                        read_cache;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+
+	[[nodiscard]] const std::vector<uint32_t>* GetSpirv(uint64_t shader_id) const {
+		auto it = compute_spirv.find(shader_id);
+		return it != compute_spirv.end() ? &it->second : nullptr;
+	}
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -574,6 +589,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	m_compiler_pool.WaitIdle();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -610,6 +626,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_manifest_path         = std::filesystem::path("_PipelineCache") / (title_id + ".manifest");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -677,6 +694,92 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+
+	PreloadPipelines();
+}
+
+void PipelineCache::SerializeManifest(
+    const std::filesystem::path& path,
+    const std::string& signature,
+    const std::vector<ManifestComputeRecord>& records) {
+	if (records.empty() || path.empty()) {
+		return;
+	}
+
+	std::vector<uint8_t> payload;
+	for (const auto& record: records) {
+		const uint32_t binding_count = static_cast<uint32_t>(record.bindings.size());
+		const uint32_t spirv_count   = static_cast<uint32_t>(record.spirv.size());
+
+		const size_t prev_size = payload.size();
+		const size_t needed    = sizeof(record.shader_id) + sizeof(record.wave_size) +
+		                      sizeof(binding_count) +
+		                      binding_count * sizeof(ManifestBinding) +
+		                      sizeof(spirv_count) + spirv_count * sizeof(uint32_t);
+		payload.resize(prev_size + needed);
+		uint8_t* ptr = payload.data() + prev_size;
+
+		std::memcpy(ptr, &record.shader_id, sizeof(record.shader_id));
+		ptr += sizeof(record.shader_id);
+		std::memcpy(ptr, &record.wave_size, sizeof(record.wave_size));
+		ptr += sizeof(record.wave_size);
+		std::memcpy(ptr, &binding_count, sizeof(binding_count));
+		ptr += sizeof(binding_count);
+		if (binding_count > 0) {
+			std::memcpy(ptr, record.bindings.data(),
+			            binding_count * sizeof(ManifestBinding));
+			ptr += binding_count * sizeof(ManifestBinding);
+		}
+		std::memcpy(ptr, &spirv_count, sizeof(spirv_count));
+		ptr += sizeof(spirv_count);
+		if (spirv_count > 0) {
+			std::memcpy(ptr, record.spirv.data(), spirv_count * sizeof(uint32_t));
+			ptr += spirv_count * sizeof(uint32_t);
+		}
+	}
+
+	const uint64_t payload_hash = XXH3_64bits(payload.data(), payload.size());
+
+	const uint32_t magic   = 0x4d46504b;
+	const uint32_t version = 1;
+	const uint32_t sig_len = static_cast<uint32_t>(signature.size());
+	const uint32_t count   = static_cast<uint32_t>(records.size());
+
+	std::vector<uint8_t> header;
+	header.reserve(sizeof(magic) + sizeof(version) + sizeof(sig_len) + sig_len +
+	               sizeof(count) + sizeof(payload_hash));
+	auto append = [&header](const void* src, size_t sz) {
+		const auto* b = static_cast<const uint8_t*>(src);
+		header.insert(header.end(), b, b + sz);
+	};
+	append(&magic, sizeof(magic));
+	append(&version, sizeof(version));
+	append(&sig_len, sizeof(sig_len));
+	append(signature.data(), sig_len);
+	append(&count, sizeof(count));
+	append(&payload_hash, sizeof(payload_hash));
+
+	if (!Common::File::CreateDirectories(path.parent_path())) {
+		return;
+	}
+
+	auto temp_path = path;
+	temp_path += ".tmp";
+
+	Common::File file;
+	uint32_t written_h = 0;
+	uint32_t written_p = 0;
+	if (file.Create(temp_path)) {
+		file.Write(header.data(), static_cast<uint32_t>(header.size()), &written_h);
+		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &written_p);
+	}
+	const bool flushed = !file.IsInvalid() && file.Flush();
+	file.Close();
+	if (written_h == header.size() && written_p == payload.size() && flushed &&
+	    Common::File::RenameFile(temp_path, path)) {
+		PipelineCacheLog("Vulkan pipeline cache: saved {} compute manifests to {}", count,
+		                 Common::PathToString(path));
+	}
 }
 
 void PipelineCache::Save() {
@@ -685,6 +788,7 @@ void PipelineCache::Save() {
 	}
 	Common::LockGuard lock(m_mutex);
 	SaveDriverCacheLocked(true);
+	SaveManifestLocked();
 }
 
 void PipelineCache::FlushDriverCache() {
@@ -706,7 +810,18 @@ void PipelineCache::FlushDriverCache() {
 	s_last_save_time.store(now, std::memory_order_relaxed);
 	m_new_pipelines_since_save.store(0, std::memory_order_relaxed);
 
+	std::vector<ManifestComputeRecord> manifest_records;
+	{
+		Common::LockGuard lock(m_mutex);
+		manifest_records.reserve(m_manifest_records.size());
+		for (const auto& [id, rec]: m_manifest_records) {
+			manifest_records.push_back(rec);
+		}
+	}
+
 	std::thread([dest = m_driver_cache_path,
+	             manifest_dest = m_manifest_path,
+	             records = std::move(manifest_records),
 	             props = m_graphics.GetPhysicalDeviceProperties(),
 	             device = m_graphics.device,
 	             driver_cache = m_driver_cache]() {
@@ -735,36 +850,38 @@ void PipelineCache::FlushDriverCache() {
 		}
 		payload.resize(size);
 		const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
-		if (payload_hash == s_last_saved_hash.load(std::memory_order_relaxed)) {
-			s_driver_cache_saving.store(false, std::memory_order_release);
-			return;
+		if (payload_hash != s_last_saved_hash.load(std::memory_order_relaxed)) {
+			auto prefix = DriverCacheSignature(props);
+			prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+			if (!Common::File::CreateDirectories(dest.parent_path())) {
+				PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+				s_driver_cache_saving.store(false, std::memory_order_release);
+				return;
+			}
+			auto temp_path = dest;
+			temp_path += ".tmp";
+
+			Common::File file;
+			uint32_t     prefix_written  = 0;
+			uint32_t     payload_written = 0;
+			if (file.Create(temp_path)) {
+				file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+				file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+			}
+			const bool flushed = !file.IsInvalid() && file.Flush();
+			file.Close();
+			if (prefix_written == prefix.size() && payload_written == payload.size() && flushed &&
+			    Common::File::RenameFile(temp_path, dest)) {
+				s_last_saved_hash.store(payload_hash, std::memory_order_relaxed);
+				PipelineCacheLog("Vulkan pipeline cache: asynchronously saved {} bytes to {}", size,
+				                 Common::PathToString(dest));
+			}
 		}
 
-		auto prefix = DriverCacheSignature(props);
-		prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-		if (!Common::File::CreateDirectories(dest.parent_path())) {
-			PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-			s_driver_cache_saving.store(false, std::memory_order_release);
-			return;
+		if (!records.empty()) {
+			SerializeManifest(manifest_dest, DriverCacheSignature(props), records);
 		}
-		auto temp_path = dest;
-		temp_path += ".tmp";
 
-		Common::File file;
-		uint32_t     prefix_written  = 0;
-		uint32_t     payload_written = 0;
-		if (file.Create(temp_path)) {
-			file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-			file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-		}
-		const bool flushed = !file.IsInvalid() && file.Flush();
-		file.Close();
-		if (prefix_written == prefix.size() && payload_written == payload.size() && flushed &&
-		    Common::File::RenameFile(temp_path, dest)) {
-			s_last_saved_hash.store(payload_hash, std::memory_order_relaxed);
-			PipelineCacheLog("Vulkan pipeline cache: asynchronously saved {} bytes to {}", size,
-			                 Common::PathToString(dest));
-		}
 		s_driver_cache_saving.store(false, std::memory_order_release);
 	}).detach();
 }
@@ -840,6 +957,239 @@ void PipelineCache::SaveDriverCacheLocked(bool destroy_cache) {
 	}
 }
 
+void PipelineCache::SaveManifestLocked() {
+	if (m_manifest_records.empty() || m_manifest_path.empty()) {
+		return;
+	}
+	std::vector<ManifestComputeRecord> records;
+	records.reserve(m_manifest_records.size());
+	for (const auto& [id, rec]: m_manifest_records) {
+		records.push_back(rec);
+	}
+	SerializeManifest(m_manifest_path,
+	                  DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), records);
+}
+
+void PipelineCache::PreloadPipelines() {
+	if (m_manifest_path.empty() || !Common::File::IsFileExisting(m_manifest_path)) {
+		return;
+	}
+
+	Common::File file(m_manifest_path, Common::File::Mode::Read);
+	const auto   file_size = file.IsInvalid() ? 0 : file.Size();
+	if (file_size < sizeof(uint32_t) * 4 + sizeof(uint64_t)) {
+		file.Close();
+		return;
+	}
+
+	uint32_t magic      = 0;
+	uint32_t version    = 0;
+	uint32_t sig_len    = 0;
+	uint32_t bytes_read = 0;
+
+	file.Read(&magic, sizeof(magic), &bytes_read);
+	file.Read(&version, sizeof(version), &bytes_read);
+	file.Read(&sig_len, sizeof(sig_len), &bytes_read);
+
+	if (magic != 0x4d46504b || version != 1 || sig_len > 4096 ||
+	    file_size < sizeof(magic) + sizeof(version) + sizeof(sig_len) + sig_len +
+	                    sizeof(uint32_t) + sizeof(uint64_t)) {
+		file.Close();
+		PipelineCacheLog("Vulkan pipeline cache: manifest invalid header or version in {}",
+		                 Common::PathToString(m_manifest_path));
+		return;
+	}
+
+	std::string signature(sig_len, '\0');
+	file.Read(signature.data(), sig_len, &bytes_read);
+	const auto expected_sig = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	if (signature != expected_sig) {
+		file.Close();
+		PipelineCacheLog("Vulkan pipeline cache: manifest signature mismatch; skipping preload");
+		return;
+	}
+
+	uint32_t pipeline_count = 0;
+	uint64_t payload_hash   = 0;
+	file.Read(&pipeline_count, sizeof(pipeline_count), &bytes_read);
+	file.Read(&payload_hash, sizeof(payload_hash), &bytes_read);
+
+	const size_t header_size = sizeof(magic) + sizeof(version) + sizeof(sig_len) + sig_len +
+	                           sizeof(pipeline_count) + sizeof(payload_hash);
+	const size_t payload_size = file_size - header_size;
+	if (payload_size == 0 && pipeline_count > 0) {
+		file.Close();
+		return;
+	}
+
+	std::vector<uint8_t> payload(payload_size);
+	if (payload_size > 0) {
+		file.Read(payload.data(), static_cast<uint32_t>(payload_size), &bytes_read);
+	}
+	file.Close();
+
+	if (bytes_read != payload_size || XXH3_64bits(payload.data(), payload.size()) != payload_hash) {
+		PipelineCacheLog("Vulkan pipeline cache: manifest checksum mismatch; skipping preload");
+		return;
+	}
+
+	std::vector<ManifestComputeRecord> records;
+	records.reserve(pipeline_count);
+
+	const uint8_t* ptr = payload.data();
+	const uint8_t* end = ptr + payload.size();
+
+	for (uint32_t i = 0; i < pipeline_count; ++i) {
+		if (ptr + sizeof(uint64_t) + sizeof(uint32_t) * 2 > end) {
+			break;
+		}
+		ManifestComputeRecord rec;
+		std::memcpy(&rec.shader_id, ptr, sizeof(rec.shader_id));
+		ptr += sizeof(rec.shader_id);
+		std::memcpy(&rec.wave_size, ptr, sizeof(rec.wave_size));
+		ptr += sizeof(rec.wave_size);
+		uint32_t binding_count = 0;
+		std::memcpy(&binding_count, ptr, sizeof(binding_count));
+		ptr += sizeof(binding_count);
+
+		if (binding_count > 256 ||
+		    ptr + binding_count * sizeof(ManifestBinding) + sizeof(uint32_t) > end) {
+			break;
+		}
+		rec.bindings.resize(binding_count);
+		if (binding_count > 0) {
+			std::memcpy(rec.bindings.data(), ptr, binding_count * sizeof(ManifestBinding));
+			ptr += binding_count * sizeof(ManifestBinding);
+		}
+
+		uint32_t spirv_count = 0;
+		std::memcpy(&spirv_count, ptr, sizeof(spirv_count));
+		ptr += sizeof(spirv_count);
+
+		if (spirv_count > 1024 * 1024 || ptr + spirv_count * sizeof(uint32_t) > end) {
+			break;
+		}
+		rec.spirv.resize(spirv_count);
+		if (spirv_count > 0) {
+			std::memcpy(rec.spirv.data(), ptr, spirv_count * sizeof(uint32_t));
+			ptr += spirv_count * sizeof(uint32_t);
+		}
+		records.push_back(std::move(rec));
+	}
+
+	if (records.empty()) {
+		return;
+	}
+
+	PipelineCacheLog("Vulkan pipeline cache: pre-warming {} compute pipelines from {}...",
+	                 records.size(), Common::PathToString(m_manifest_path));
+	const auto start_time = Common::Timer::QueryPerformanceCounter();
+
+	for (auto& rec: records) {
+		m_compiler_pool.Enqueue([this, record = std::move(rec)]() {
+			vk::ShaderModuleCreateInfo create_info {};
+			create_info.codeSize    = record.spirv.size() * sizeof(uint32_t);
+			create_info.pCode       = record.spirv.data();
+			vk::ShaderModule module = nullptr;
+			auto             res =
+			    m_graphics.device.createShaderModule(&create_info, nullptr, &module);
+			if (res != vk::Result::eSuccess || module == nullptr) {
+				return;
+			}
+
+			auto                                        pipeline = std::make_shared<Pipeline>();
+			std::vector<vk::DescriptorSetLayoutBinding> bindings;
+			bindings.reserve(record.bindings.size());
+			for (const auto& b: record.bindings) {
+				bindings.push_back({
+				    .binding         = b.binding,
+				    .descriptorType  = static_cast<vk::DescriptorType>(b.descriptor_type),
+				    .descriptorCount = b.descriptor_count,
+				    .stageFlags      = static_cast<vk::ShaderStageFlags>(b.stage_flags),
+				    .pImmutableSamplers = nullptr,
+				});
+			}
+
+			CreateComputePipelineDirect(m_graphics, *pipeline, module, record.wave_size, bindings,
+			                            m_driver_cache);
+			m_graphics.device.destroyShaderModule(module, nullptr);
+
+			if (pipeline->pipeline != nullptr) {
+				Common::LockGuard lock(m_mutex);
+				m_compute_pipelines.emplace(record.shader_id, std::move(pipeline));
+				m_manifest_records.emplace(record.shader_id, std::move(record));
+			}
+		});
+	}
+
+	m_compiler_pool.WaitIdle();
+	const auto elapsed = Common::Timer::QueryPerformanceCounter() - start_time;
+	const double elapsed_sec =
+	    static_cast<double>(elapsed) / static_cast<double>(Common::Timer::QueryPerformanceFrequency());
+	PipelineCacheLog("Vulkan pipeline cache: pre-warmed {} compute pipelines in {:.3f}s",
+	                 m_compute_pipelines.size(), elapsed_sec);
+}
+
+void PipelineCache::RecordManifestComputeLocked(
+    uint64_t shader_id, uint32_t wave_size,
+    const ShaderRecompiler::IR::CompiledShaderInfo& program,
+    std::span<const uint32_t> spirv) {
+	std::vector<vk::DescriptorSetLayoutBinding> vk_bindings;
+	AddLayoutBindings(vk_bindings, program, vk::ShaderStageFlagBits::eCompute);
+
+	ManifestComputeRecord record {};
+	record.shader_id = shader_id;
+	record.wave_size = wave_size;
+	record.bindings.reserve(vk_bindings.size());
+	for (const auto& b: vk_bindings) {
+		record.bindings.push_back({
+		    .binding          = b.binding,
+		    .descriptor_type  = static_cast<uint32_t>(b.descriptorType),
+		    .descriptor_count = b.descriptorCount,
+		    .stage_flags      = static_cast<uint32_t>(b.stageFlags),
+		});
+	}
+	record.spirv.assign(spirv.begin(), spirv.end());
+
+	m_manifest_records.emplace(shader_id, std::move(record));
+}
+
+void PipelineCache::SubmitSpeculativeComputeLocked(const ShaderProgram& handle,
+                                                  const ShaderComputeInputInfo& input_info) {
+	if (!handle || !input_info.stage || !input_info.stage.program) {
+		return;
+	}
+	const uint64_t shader_id = handle.id;
+
+	if (!m_manifest_records.contains(shader_id)) {
+		if (const auto* spirv = m_program_cache->GetSpirv(shader_id)) {
+			RecordManifestComputeLocked(shader_id, input_info.stage.program->wave_size,
+			                            *input_info.stage.program, *spirv);
+		}
+	}
+
+	if (m_compute_pipelines.contains(shader_id) || m_in_flight_compute.contains(shader_id)) {
+		return;
+	}
+
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
+	                  vk::ShaderStageFlagBits::eCompute);
+
+	const uint32_t   wave_size = input_info.stage.program->wave_size;
+	vk::ShaderModule module    = handle.module;
+
+	auto future = m_compiler_pool.Enqueue([this, module, wave_size,
+	                                       bindings = std::move(descriptor_bindings)]() {
+		auto pipeline = std::make_shared<Pipeline>();
+		CreateComputePipelineDirect(m_graphics, *pipeline, module, wave_size, bindings,
+		                            m_driver_cache);
+		return pipeline;
+	});
+
+	m_in_flight_compute.emplace(shader_id, std::move(future).share());
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -901,7 +1251,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	const auto program = m_program_cache->Get(params, input_info, push_data_cursor);
+	SubmitSpeculativeComputeLocked(program, input_info);
+	return program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
@@ -1149,26 +1501,57 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		return *iter->second;
 	}
 
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(input_info);
+	std::shared_ptr<Pipeline> compiled_pipeline;
+
+	auto in_flight = m_in_flight_compute.find(compute_program.id);
+	if (in_flight != m_in_flight_compute.end()) {
+		auto future = in_flight->second;
+		m_mutex.Unlock();
+		compiled_pipeline = future.get();
+		m_mutex.Lock();
+
+		auto existing = m_compute_pipelines.find(compute_program.id);
+		if (existing != m_compute_pipelines.end()) {
+			m_in_flight_compute.erase(compute_program.id);
+			auto* result_pipeline = existing->second.get();
+			for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
+				m_compute_mru[j] = m_compute_mru[j - 1];
+			}
+			m_compute_mru[0] = {.id = compute_program.id, .pipeline = result_pipeline};
+			return *result_pipeline;
+		}
+		m_in_flight_compute.erase(compute_program.id);
+	} else {
+		if (graphics_debug_dump_enabled()) {
+			ShaderDbgDumpInputInfo(input_info);
+		}
+		compiled_pipeline = std::make_shared<Pipeline>();
+		CreatePipelineInternal(m_graphics, *compiled_pipeline, input_info,
+		                       compute_program.module, m_driver_cache);
+		if (!m_manifest_records.contains(compute_program.id) && input_info.stage &&
+		    input_info.stage.program) {
+			if (const auto* spirv = m_program_cache->GetSpirv(compute_program.id)) {
+				RecordManifestComputeLocked(compute_program.id,
+				                            input_info.stage.program->wave_size,
+				                            *input_info.stage.program, *spirv);
+			}
+		}
 	}
 
-	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	EXIT_NOT_IMPLEMENTED(compiled_pipeline->pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(compiled_pipeline->pipeline_layout == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
-	EXIT_IF(!inserted);
+	auto [iter, inserted] =
+	    m_compute_pipelines.emplace(compute_program.id, std::move(compiled_pipeline));
+	auto* result_pipeline = iter->second.get();
 
 	for (size_t j = COMPUTE_MRU_SIZE - 1; j > 0; j--) {
 		m_compute_mru[j] = m_compute_mru[j - 1];
 	}
-	m_compute_mru[0] = {.id = compute_program.id, .pipeline = iter->second.get()};
+	m_compute_mru[0] = {.id = compute_program.id, .pipeline = result_pipeline};
 
 	m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);
 
-	return *iter->second;
+	return *result_pipeline;
 }
 } // namespace Libs::Graphics

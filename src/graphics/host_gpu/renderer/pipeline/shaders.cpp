@@ -389,9 +389,9 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
-                              const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+                       const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                       vk::ShaderStageFlagBits              stage) {
 	for (const auto& binding: program.bindings.descriptors) {
 		descriptor_bindings.push_back(
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
@@ -790,10 +790,10 @@ void CreatePipelineInternal(
 	}
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+void CreateComputePipelineDirect(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                vk::ShaderModule compute_module, uint32_t wave_size,
+                                std::span<const vk::DescriptorSetLayoutBinding> layout_bindings,
+                                vk::PipelineCache driver_cache) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -801,18 +801,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
-	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
-	                  vk::ShaderStageFlagBits::eCompute);
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	CreateDescriptorLayout(graphics, pipeline, layout_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
@@ -824,12 +819,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
+	if (graphics_debug_dump_enabled()) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
+		     1u);
+	}
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	if (graphics_debug_dump_enabled()) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
@@ -841,15 +840,32 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
+	if (graphics_debug_dump_enabled()) {
+		LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
+		     static_cast<void*>(pipeline.pipeline_layout));
+	}
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (graphics_debug_dump_enabled()) {
+		LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+	EXIT_IF(!input_info.stage);
+	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
+	                  vk::ShaderStageFlagBits::eCompute);
+	CreateComputePipelineDirect(graphics, pipeline, compute_module,
+	                            input_info.stage.program->wave_size, descriptor_bindings,
+	                            driver_cache);
 }
 
 } // namespace Libs::Graphics
