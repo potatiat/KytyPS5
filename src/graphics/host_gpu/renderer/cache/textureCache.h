@@ -83,7 +83,7 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	void RunGarbageCollector(bool force = false);
 
 private:
 	enum class TransferDirection { Upload, Download };

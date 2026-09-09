@@ -2220,20 +2220,20 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RunGarbageCollector(bool force) {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		bool           pressured  = force || m_total_used_memory >= m_pressure_gc_memory;
+		bool           aggressive = (force || allow_aggressive) && (force || m_total_used_memory >= m_critical_gc_memory);
+		const uint64_t age       = force ? 0 : std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		size_t         deletions = force ? 128 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2276,7 +2276,7 @@ void TextureCache::RunGarbageCollector() {
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (force || m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

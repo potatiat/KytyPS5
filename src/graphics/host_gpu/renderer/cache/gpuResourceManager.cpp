@@ -6,10 +6,15 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
+    : m_graphics(graphics), m_scheduler(scheduler),
+      m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {
+	m_graphics.on_out_of_memory = [this] { RunGarbageCollector(true); };
+}
 
-GpuResourceManager::~GpuResourceManager() = default;
+GpuResourceManager::~GpuResourceManager() {
+	m_graphics.on_out_of_memory = nullptr;
+}
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
@@ -109,14 +114,14 @@ void GpuResourceManager::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
-void GpuResourceManager::RunGarbageCollector() {
+void GpuResourceManager::RunGarbageCollector(bool force) {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(force);
+	m_buffer_cache.RunGarbageCollector(force);
 }
 
 } // namespace Libs::Graphics

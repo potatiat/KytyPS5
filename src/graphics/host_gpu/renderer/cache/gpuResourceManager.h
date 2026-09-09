@@ -31,9 +31,10 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool force = false);
 
 private:
+	GraphicContext&           m_graphics;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

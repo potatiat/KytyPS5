@@ -673,7 +673,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			rejection = "zero size";
 		} else if (size.align == 0) {
 			rejection = "zero alignment";
-		} else if ((address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		} else if ((address & 0xFFu) != 0) {
 			rejection = "unaligned base address";
 		}
 	}

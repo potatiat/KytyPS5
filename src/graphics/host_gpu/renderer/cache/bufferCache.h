@@ -73,7 +73,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool force = false);
 
 private:
 	friend struct BufferCacheTestAccess;

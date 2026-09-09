@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -106,6 +107,7 @@ struct GraphicContext {
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
+	std::function<void()> on_out_of_memory;
 
 private:
 	mutable std::mutex                                 m_format_properties_mutex;
