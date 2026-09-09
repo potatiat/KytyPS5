@@ -173,8 +173,8 @@ private:
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
-		PreparedBindings                vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings& vertex;
+		PreparedBindings* pixel = nullptr;
 	};
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -198,7 +198,7 @@ private:
 	                         bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
-	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
+	                                               const PreparedBindings* pixel = nullptr);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage, vk::ImageAspectFlags aspect = {});

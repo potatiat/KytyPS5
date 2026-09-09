@@ -888,9 +888,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
-	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+	const auto buffer_count = program.info.buffers.size();
+	if (prepared.buffer_sources.size() != buffer_count) {
+		prepared.buffer_sources.resize(buffer_count);
+	}
+	for (uint32_t i = 0; i < buffer_count; i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
 		const auto stride  = descriptor.Stride();
@@ -898,11 +900,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.push_back({});
+			prepared.buffer_sources[i] = {};
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		auto& src = prepared.buffer_sources[i];
+		if (src.address == address && src.size == size && src.id &&
+		    cache.GetBuffer(src.id).IsInBounds(address, size)) {
+			continue;
+		}
+		src = {address, size, cache.FindBuffer(address, size)};
 	}
 }
 
@@ -914,8 +921,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
 
+	const auto buffer_count = program.info.buffers.size();
 	prepared.buffers.clear();
-	prepared.buffers.reserve(program.info.buffers.size());
+	prepared.buffers.reserve(buffer_count);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -924,7 +932,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+	for (uint32_t i = 0; i < buffer_count; i++) {
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
@@ -1003,29 +1011,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	PrepareBindings(vertex, m_vertex_bindings);
+	FindBuffers(m_vertex_bindings);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		PrepareBindings(pixel, m_pixel_bindings);
+		FindBuffers(m_pixel_bindings);
 	}
-	FindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		FindBuffers(*bindings.pixel);
-	}
-	if (bindings.vertex.runtime->program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
+	if (m_vertex_bindings.runtime->program->info.uses_dma ||
+	    (pixel_active && m_pixel_bindings.runtime->program->info.uses_dma)) {
 		m_context.GetGpuResources().PrepareBda();
 	}
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		RebindBuffers(*bindings.pixel);
+	RebindBuffers(m_vertex_bindings);
+	if (pixel_active) {
+		RebindBuffers(m_pixel_bindings);
 	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
-		RebindImages(*bindings.pixel);
+	RebindImages(m_vertex_bindings);
+	if (pixel_active) {
+		RebindImages(m_pixel_bindings);
 	}
-	return bindings;
+	return {.vertex = m_vertex_bindings, .pixel = pixel_active ? &m_pixel_bindings : nullptr};
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

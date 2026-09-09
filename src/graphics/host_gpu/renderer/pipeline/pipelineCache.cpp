@@ -99,19 +99,115 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+// One preparation can evaluate the same SRT words through descriptor, predicate, and
+// flattened-value evaluators. Snapshot clean blocks once for this preparation only.
+// Dirty or partially mapped blocks fall back to the exact requested word so a read
+// never forces an unrelated GPU resource to synchronize.
+struct ShaderGuestReadCache {
+	static constexpr uint64_t BlockSize = 256;
+	static constexpr size_t   MaxBlocks = 4096;
+	struct Block {
+		uint64_t                       address;
+		std::array<uint8_t, BlockSize> bytes;
+	};
+	struct Slot {
+		uint32_t generation = 0;
+		uint32_t index      = 0;
+	};
+	std::array<Slot, MaxBlocks * 2>        slots {};
+	std::vector<Block>                     blocks;
+	std::unordered_map<uint64_t, uint32_t> words;
+	uint32_t                               generation = 0;
+
+	void Reset() {
+		// Retain storage, but never retain guest values between preparations.
+		blocks.clear();
+		words.clear();
+		if (++generation == 0) {
+			slots.fill({});
+			generation = 1;
+		}
+	}
+
+	Slot& FindSlot(uint64_t address) {
+		auto index =
+		    static_cast<size_t>(XXH3_64bits(&address, sizeof(address))) & (slots.size() - 1);
+		while (slots[index].generation == generation &&
+		       blocks[slots[index].index].address != address) {
+			index = (index + 1) & (slots.size() - 1);
+		}
+		return slots[index];
+	}
+};
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
+	if (value == nullptr) return false;
+	if (userdata == nullptr) {
+		return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+	}
+	auto&      cache  = *static_cast<ShaderGuestReadCache*>(userdata);
+	const auto base   = address & ~(ShaderGuestReadCache::BlockSize - 1u);
+	const auto offset = address - base;
+	if (offset <= ShaderGuestReadCache::BlockSize - sizeof(*value)) {
+		const auto& slot = cache.FindSlot(base);
+		if (slot.generation == cache.generation) {
+			std::memcpy(value, cache.blocks[slot.index].bytes.data() + offset, sizeof(*value));
+			return true;
+		}
+	}
+	if (const auto found = cache.words.find(address); found != cache.words.end()) {
+		*value = found->second;
+		return true;
+	}
+	if (offset <= ShaderGuestReadCache::BlockSize - sizeof(*value) &&
+	    cache.blocks.size() < ShaderGuestReadCache::MaxBlocks) {
+		std::array<uint8_t, ShaderGuestReadCache::BlockSize> block;
+		if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, block.data(), block.size())) {
+			std::memcpy(value, block.data() + offset, sizeof(*value));
+			auto& slot = cache.FindSlot(base);
+			slot       = {cache.generation, static_cast<uint32_t>(cache.blocks.size())};
+			cache.blocks.push_back({base, std::move(block)});
+			return true;
+		}
+	}
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value))) {
+		return false;
+	}
+	cache.words.emplace(address, *value);
+	return true;
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
-bool ReadShaderGuestMemoryBlock(void*, uint64_t address, uint32_t* words, uint32_t word_count) {
-	return words != nullptr && word_count != 0 &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(
-	           address, words, uint64_t {word_count} * sizeof(uint32_t));
+bool ReadShaderGuestMemoryBlock(void* userdata, uint64_t address, uint32_t* words, uint32_t word_count) {
+	if (words == nullptr || word_count == 0) return false;
+	const uint64_t byte_size = uint64_t {word_count} * sizeof(uint32_t);
+	if (userdata == nullptr) {
+		return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, words, byte_size);
+	}
+	auto&      cache  = *static_cast<ShaderGuestReadCache*>(userdata);
+	const auto base   = address & ~(ShaderGuestReadCache::BlockSize - 1u);
+	const auto offset = address - base;
+	if (offset + byte_size <= ShaderGuestReadCache::BlockSize) {
+		const auto& slot = cache.FindSlot(base);
+		if (slot.generation == cache.generation) {
+			std::memcpy(words, cache.blocks[slot.index].bytes.data() + offset, byte_size);
+			return true;
+		}
+		if (cache.blocks.size() < ShaderGuestReadCache::MaxBlocks) {
+			std::array<uint8_t, ShaderGuestReadCache::BlockSize> block;
+			if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, block.data(), block.size())) {
+				std::memcpy(words, block.data() + offset, byte_size);
+				auto& new_slot = cache.FindSlot(base);
+				new_slot       = {cache.generation, static_cast<uint32_t>(cache.blocks.size())};
+				cache.blocks.push_back({base, std::move(block)});
+				return true;
+			}
+		}
+	}
+	return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, words, byte_size);
 }
 
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
@@ -225,6 +321,14 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
+	struct CachedSnapshot {
+		std::vector<uint32_t>                        user_data;
+		uint64_t                                     shader_base = 0;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		bool                                         valid = false;
+	};
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
@@ -233,6 +337,7 @@ struct PipelineCache::ProgramCache {
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+		CachedSnapshot                     last_snapshot;
 	};
 
 	struct ProgramKeyHash {
@@ -329,19 +434,40 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		read_cache.Reset();
+		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemory,
+		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report));
+			if (entry->second.last_snapshot.valid &&
+			    !entry->second.resource_plan.requires_specialization_memory &&
+			    entry->second.last_snapshot.shader_base == params.Base() &&
+			    entry->second.last_snapshot.user_data.size() == params.user_data.size() &&
+			    std::memcmp(entry->second.last_snapshot.user_data.data(), params.user_data.data(),
+			                params.user_data.size() * sizeof(uint32_t)) == 0) {
+				resources      = entry->second.last_snapshot.resources;
+				specialization = entry->second.last_snapshot.specialization;
+			} else {
+				ReportMaterialization(label, stage, params.hash, report,
+				                      ShaderRecompiler::IR::MaterializeResources(
+				                          entry->second.resource_plan, runtime, resources,
+				                          specialization, &report));
+				if (!entry->second.resource_plan.requires_specialization_memory) {
+					entry->second.last_snapshot.user_data.assign(params.user_data.begin(),
+					                                             params.user_data.end());
+					entry->second.last_snapshot.shader_base    = params.Base();
+					entry->second.last_snapshot.resources      = resources;
+					entry->second.last_snapshot.specialization = specialization;
+					entry->second.last_snapshot.valid          = true;
+				}
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -392,7 +518,16 @@ struct PipelineCache::ProgramCache {
 			ReportMaterialization(label, stage, params.hash, report,
 			                      ShaderRecompiler::IR::MaterializeResources(
 			                          resource_plan, runtime, resources, specialization, &report));
+			const bool requires_mem = resource_plan.requires_specialization_memory;
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (!requires_mem) {
+				entry->second.last_snapshot.user_data.assign(params.user_data.begin(),
+				                                             params.user_data.end());
+				entry->second.last_snapshot.shader_base    = params.Base();
+				entry->second.last_snapshot.resources      = resources;
+				entry->second.last_snapshot.specialization = specialization;
+				entry->second.last_snapshot.valid          = true;
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
@@ -427,6 +562,7 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	ShaderGuestReadCache                                        read_cache;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };

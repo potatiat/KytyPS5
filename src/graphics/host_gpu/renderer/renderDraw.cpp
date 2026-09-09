@@ -528,7 +528,7 @@ struct DrawCallInfo {
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
-                                                 const std::optional<PreparedBindings>& pixel) {
+                                                 const PreparedBindings* pixel) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
@@ -628,7 +628,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const bool feedback = depth.depth_write_enable && pixel.has_value() &&
+		const bool feedback = depth.depth_write_enable && pixel != nullptr &&
 		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
 			    if (binding.image_id != depth.image_id ||
 			        binding.desc.type != TextureCache::BindingType::Texture) {
@@ -1220,16 +1220,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	if (bindings.pixel.has_value()) {
+	if (bindings.pixel != nullptr) {
 		if (set_auto_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 		}
 	}
-	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
-	const size_t                     descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
-	if (bindings.pixel) {
-		descriptor_stages[1] = &*bindings.pixel;
-	}
+	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, bindings.pixel};
+	const size_t                     descriptor_stage_count = bindings.pixel != nullptr ? 2u : 1u;
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	if (mesh_active) {
