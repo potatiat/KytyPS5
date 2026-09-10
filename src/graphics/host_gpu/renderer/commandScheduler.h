@@ -43,6 +43,8 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool IsRendering() const noexcept { return m_command.IsRendering(); }
+	[[nodiscard]] const RenderState& GetRenderState() const noexcept { return m_command.GetRenderState(); }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }

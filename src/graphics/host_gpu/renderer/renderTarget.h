@@ -35,6 +35,30 @@ struct RenderState {
 	bool operator==(const RenderState&) const = default;
 };
 
+[[nodiscard]] inline bool AttachmentsMatch(const RenderState& a, const RenderState& b) {
+	if (a.width != b.width || a.height != b.height || a.num_layers != b.num_layers ||
+	    a.num_color_attachments != b.num_color_attachments) {
+		return false;
+	}
+	for (uint32_t i = 0; i < a.num_color_attachments; i++) {
+		if (a.color_attachments[i].image_view != b.color_attachments[i].image_view ||
+		    a.color_attachments[i].image_layout != b.color_attachments[i].image_layout) {
+			return false;
+		}
+	}
+	if (a.depth_stencil_attachment.has_depth != b.depth_stencil_attachment.has_depth ||
+	    a.depth_stencil_attachment.has_stencil != b.depth_stencil_attachment.has_stencil) {
+		return false;
+	}
+	if (a.depth_stencil_attachment.has_depth || a.depth_stencil_attachment.has_stencil) {
+		if (a.depth_stencil_attachment.image_view != b.depth_stencil_attachment.image_view ||
+		    a.depth_stencil_attachment.image_layout != b.depth_stencil_attachment.image_layout) {
+			return false;
+		}
+	}
+	return true;
+}
+
 [[nodiscard]] inline constexpr uint32_t render_sample_count(uint32_t encoded_samples) {
 	return encoded_samples <= 3 ? 1u << encoded_samples : 0;
 }
