@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -167,16 +168,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
-	const char* access = "Read";
-	if (resource.written && resource.read) {
-		access = "ReadWrite";
-	} else if (resource.written) {
-		access = "Write";
+	if (Config::GraphicsDebugDumpEnabled()) {
+		const char* access = "Read";
+		if (resource.written && resource.read) {
+			access = "ReadWrite";
+		} else if (resource.written) {
+			access = "Write";
+		}
+		SetVulkanObjectNameF(
+		    graphics.device, result.buffer,
+		    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
+		    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, result.buffer,
-	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
 	return result;
 }
 
@@ -337,8 +340,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const auto max_mip = resource.r128 ? descriptor.LastLevel()
-	                                   : std::max<uint8_t>(descriptor.MaxMip(), descriptor.LastLevel());
+	const auto max_mip = resource.r128 ? descriptor.LastLevel() : std::max<uint8_t>(descriptor.MaxMip(), descriptor.LastLevel());
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
 	        ? descriptor.LastLevel()
@@ -599,8 +601,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto last_level   = descriptor.LastLevel();
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
-	const auto max_mip =
-	    resource.r128 ? last_level : std::max<uint8_t>(descriptor.MaxMip(), last_level);
+	const auto max_mip = resource.r128 ? last_level : std::max<uint8_t>(descriptor.MaxMip(), last_level);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;

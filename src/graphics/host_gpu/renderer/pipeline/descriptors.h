@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -19,10 +20,10 @@ namespace Libs::Graphics {
 struct ShaderStageRuntime;
 
 struct TextureBinding {
-	ImageId                    image_id;
-	vk::ImageView              image_view = nullptr;
-	TextureCache::ImageDesc    desc;
-	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
+	ImageId                                image_id;
+	vk::ImageView                          image_view = nullptr;
+	TextureCache::ImageDesc                desc;
+	vk::ImageLayout                        layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
 };
 
@@ -41,9 +42,9 @@ struct PreparedBindings {
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
-	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
-	vk::DescriptorBufferInfo              flattened_srt;
-	vk::DescriptorBufferInfo              shader_data_buffer;
+	vk::DescriptorBufferInfo                          gds {nullptr, 0, VK_WHOLE_SIZE};
+	vk::DescriptorBufferInfo                          flattened_srt;
+	vk::DescriptorBufferInfo                          shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
 };
 

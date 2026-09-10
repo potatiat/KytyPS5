@@ -71,6 +71,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.drawIndirectCount         = VK_TRUE;
 	return features;
 }
 
@@ -294,6 +295,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.drawIndirectCount == VK_TRUE &&
+		    features12.drawIndirectCount != VK_TRUE) {
+			LOGF("drawIndirectCount is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.multiDrawIndirect != VK_TRUE) {
+			LOGF("multiDrawIndirect is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
@@ -644,7 +654,18 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool index_uint8_extension =
+	    HasExtension(device_extensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+	vk::PhysicalDeviceIndexTypeUint8FeaturesEXT supported_index_uint8 {};
+	if (index_uint8_extension) {
+		supported_index_uint8.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_index_uint8;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.index_type_uint8_enabled =
+	    index_uint8_extension && supported_index_uint8.indexTypeUint8;
+	LOGF("Vulkan index type uint8 support: %s\n",
+	     graphics.index_type_uint8_enabled ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -689,10 +710,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.drawIndirectCount == VK_TRUE &&
+	                     supported_features12.drawIndirectCount != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiDrawIndirect != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
 	vk::PhysicalDeviceFeatures device_features {};
+	device_features.multiDrawIndirect        = VK_TRUE;
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
@@ -765,6 +790,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::PhysicalDeviceIndexTypeUint8FeaturesEXT enabled_index_uint8 {};
+	enabled_index_uint8.indexTypeUint8 = VK_TRUE;
+	if (graphics.index_type_uint8_enabled) {
+		enabled_index_uint8.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &enabled_index_uint8;
 	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
@@ -1160,7 +1191,8 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
