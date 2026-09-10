@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -74,6 +76,27 @@ struct DrawAutoArgs {
 	uint32_t         render_target_slice_offset = 0;
 };
 
+struct DrawIndirectArgs {
+	uint64_t         args_addr                  = 0;
+	bool             indexed                    = false;
+	uint32_t         index_type_and_size        = 0;
+	uint64_t         index_base_addr            = 0;
+	uint32_t         index_buffer_size          = 0;
+	uint32_t         render_target_slice_offset = 0;
+};
+
+struct DrawIndirectMultiArgs {
+	uint64_t         args_addr                  = 0;
+	uint32_t         max_count_or_count         = 0;
+	uint64_t         count_addr                 = 0;
+	uint32_t         stride_in_bytes            = 0;
+	bool             indexed                    = false;
+	uint32_t         index_type_and_size        = 0;
+	uint64_t         index_base_addr            = 0;
+	uint32_t         index_buffer_size          = 0;
+	uint32_t         render_target_slice_offset = 0;
+};
+
 struct SubmitInfo {
 	static constexpr uint32_t MaxSemaphores = 3;
 
@@ -100,6 +123,22 @@ struct SubmitInfo {
 	}
 };
 
+struct PreparedIndexBuffer {
+	vk::Buffer     buffer = nullptr;
+	vk::DeviceSize offset = 0;
+	vk::IndexType  type   = vk::IndexType::eUint16;
+	bool operator==(const PreparedIndexBuffer&) const = default;
+};
+
+struct PreparedVertexBuffers {
+	static constexpr uint32_t MaxBuffers = 32; // ShaderVertexInputInfo::RES_MAX
+
+	std::array<vk::Buffer, MaxBuffers>     buffers {};
+	std::array<vk::DeviceSize, MaxBuffers> offsets {};
+	uint32_t                               count = 0;
+	bool operator==(const PreparedVertexBuffers&) const = default;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -107,6 +146,8 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] const RenderState& GetRenderState() const noexcept { return m_render_state; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
@@ -152,12 +193,19 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
+
+	void DrawIndirect(uint64_t submit_id, CommandBuffer& buffer, const DrawIndirectArgs& args);
+	void DrawIndirectMulti(uint64_t submit_id, CommandBuffer& buffer, const DrawIndirectMultiArgs& args);
+	void FlushIndirectBatch();
+
+	void OnCommandBufferBegin();
 
 	void                           PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
@@ -213,9 +261,13 @@ private:
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	void InitIndirectConverter();
+	void DestroyIndirectConverter();
+
 public:
 	struct DynamicStateCache {
 		vk::CommandBuffer            last_vk_buffer = nullptr;
+		uint64_t                     dirty_mask = ~0ull;
 		uint32_t                     viewport_count = 0;
 		std::array<vk::Viewport, 16> viewports {};
 		uint32_t                     scissor_count = 0;
@@ -229,27 +281,76 @@ public:
 		float                        depth_bias_const = -1.0f;
 		float                        depth_bias_clamp = -1.0f;
 		float                        depth_bias_slope = -1.0f;
+		uint32_t                     stencil_front_compare_mask = ~0u;
+		uint32_t                     stencil_back_compare_mask = ~0u;
+		uint32_t                     stencil_front_write_mask = ~0u;
+		uint32_t                     stencil_back_write_mask = ~0u;
+		uint32_t                     stencil_front_ref = ~0u;
+		uint32_t                     stencil_back_ref = ~0u;
 		uint32_t                     color_write_count = 0;
 		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enable {};
 
 		void Invalidate() {
 			last_vk_buffer = nullptr;
+			dirty_mask     = ~0ull;
 		}
 	};
 
 private:
-	DynamicStateCache                     m_dynamic_state_cache;
-	PreparedBindings                      m_vertex_bindings;
-	PreparedBindings                      m_pixel_bindings;
-	PreparedBindings                      m_compute_bindings;
-	RenderContext&                        m_context;
+
+	uint64_t                  m_last_indirect_args_vaddr = 0;
+	BufferId                  m_last_indirect_args_id {};
+	uint64_t                  m_last_draw_indirect_args_vaddr = 0;
+	BufferId                  m_last_draw_indirect_args_id {};
+
+	DynamicStateCache                                 m_dynamic_state_cache;
+	PreparedBindings                                  m_vertex_bindings;
+	PreparedBindings                                  m_pixel_bindings;
+	PreparedBindings                                  m_compute_bindings;
+	RenderContext&                                    m_context;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
-	std::unordered_set<uint64_t> m_unrepresentable_textures;
-	std::unordered_set<uint64_t> m_depth_tiled_reports;
+	std::unordered_set<uint64_t>                      m_unrepresentable_textures;
+	std::unordered_set<uint64_t>                      m_depth_tiled_reports;
+
+	struct IndirectBatch {
+		bool                     active = false;
+		uint64_t                 submit_id = 0;
+		CommandBuffer*           buffer = nullptr;
+		vk::CommandBuffer        vk_buffer = nullptr;
+		vk::Buffer               indirect_buffer = nullptr;
+		vk::DeviceSize           indirect_offset = 0;
+		uint32_t                 draw_count = 0;
+		uint32_t                 stride = 0;
+		bool                     indexed = false;
+		uint64_t                 last_args_addr = 0;
+		vk::Pipeline             pipeline = nullptr;
+		vk::PrimitiveTopology    topology = vk::PrimitiveTopology::ePointList;
+		bool                     primitive_restart = false;
+		PreparedVertexBuffers    vertex_bindings {};
+		PreparedIndexBuffer      index_binding {};
+		PreparedBindings         vertex_desc {};
+		PreparedBindings         pixel_desc {};
+		bool                     has_pixel = false;
+		RenderState              render_state {};
+		vk::PipelineStageFlags   shader_write_stages = {};
+
+		// State comparison for batch coalescing
+		uint64_t                 vs_data_addr = 0;
+		uint64_t                 ps_data_addr = 0;
+		uint32_t                 vs_user_sgpr_count = 0;
+		uint32_t                 ps_user_sgpr_count = 0;
+		std::array<uint32_t, 16> vs_user_sgpr {};
+		std::array<uint32_t, 16> ps_user_sgpr {};
+		uint64_t                 index_base_addr = 0;
+		uint32_t                 index_type_and_size = 0;
+	};
+
+	IndirectBatch m_indirect_batch {};
+
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

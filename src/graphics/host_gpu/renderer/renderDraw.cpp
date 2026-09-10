@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -461,18 +462,36 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	}
 
 	if (depth.stencil_test_enable) {
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-		                                depth.stencil_dynamic_front.compareMask);
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-		                                depth.stencil_dynamic_back.compareMask);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.writeMask);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.writeMask);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.reference);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.reference);
+		if (is_new_buffer || cache.stencil_front_compare_mask != depth.stencil_dynamic_front.compareMask) {
+			vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
+			                                depth.stencil_dynamic_front.compareMask);
+			cache.stencil_front_compare_mask = depth.stencil_dynamic_front.compareMask;
+		}
+		if (is_new_buffer || cache.stencil_back_compare_mask != depth.stencil_dynamic_back.compareMask) {
+			vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
+			                                depth.stencil_dynamic_back.compareMask);
+			cache.stencil_back_compare_mask = depth.stencil_dynamic_back.compareMask;
+		}
+		if (is_new_buffer || cache.stencil_front_write_mask != depth.stencil_dynamic_front.writeMask) {
+			vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
+			                              depth.stencil_dynamic_front.writeMask);
+			cache.stencil_front_write_mask = depth.stencil_dynamic_front.writeMask;
+		}
+		if (is_new_buffer || cache.stencil_back_write_mask != depth.stencil_dynamic_back.writeMask) {
+			vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
+			                              depth.stencil_dynamic_back.writeMask);
+			cache.stencil_back_write_mask = depth.stencil_dynamic_back.writeMask;
+		}
+		if (is_new_buffer || cache.stencil_front_ref != depth.stencil_dynamic_front.reference) {
+			vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
+			                              depth.stencil_dynamic_front.reference);
+			cache.stencil_front_ref = depth.stencil_dynamic_front.reference;
+		}
+		if (is_new_buffer || cache.stencil_back_ref != depth.stencil_dynamic_back.reference) {
+			vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
+			                              depth.stencil_dynamic_back.reference);
+			cache.stencil_back_ref = depth.stencil_dynamic_back.reference;
+		}
 	}
 
 #if defined(__APPLE__)
@@ -551,15 +570,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     target.target_slot, image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
-		                     target.target_slot, image.info.data.address,
-		                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
-		                     target.desc.view_info.layer_count);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
+			                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
+			                     target.target_slot, image.info.data.address, image.info.data.size,
+			                     static_cast<uint32_t>(image.info.pixel_format));
+			SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
+			                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
+			                     target.target_slot, image.info.data.address,
+			                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
+			                     target.desc.view_info.layer_count);
+		}
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		if (attachment_samples == 0) {
 			attachment_samples = target.desc.info.samples;
@@ -613,14 +634,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
-		                     image.info.data.address, depth.desc.view_info.base_layer,
-		                     depth.desc.view_info.layer_count);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
+			                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
+			                     image.info.data.address, image.info.data.size,
+			                     static_cast<uint32_t>(image.info.pixel_format));
+			SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
+			                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
+			                     image.info.data.address, depth.desc.view_info.base_layer,
+			                     depth.desc.view_info.layer_count);
+		}
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
@@ -737,10 +760,18 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 }
 
 struct DrawEmitInfo {
-	bool     indexed       = false;
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
-	uint32_t first_instance = 0;
+	bool         indexed         = false;
+	int32_t      vertex_offset   = 0;
+	uint32_t     first_vertex    = 0;
+	uint32_t     first_instance  = 0;
+	bool         indirect        = false;
+	bool         batched         = false;
+	vk::Buffer   indirect_buffer = nullptr;
+	VkDeviceSize indirect_offset = 0;
+	uint32_t     draw_count      = 1;
+	uint32_t     stride          = 0;
+	vk::Buffer   count_buffer    = nullptr;
+	VkDeviceSize count_offset    = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -751,11 +782,7 @@ struct DrawIndexBufferSource {
 	uint32_t      guest_element_size = 0;
 };
 
-struct PreparedIndexBuffer {
-	vk::Buffer     buffer = nullptr;
-	vk::DeviceSize offset = 0;
-	vk::IndexType  type   = vk::IndexType::eUint16;
-};
+
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
                                            const ShaderVertexInputInfo& info) {
@@ -786,13 +813,7 @@ struct VertexBufferRange {
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
 
-struct PreparedVertexBuffers {
-	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	uint32_t                               count = 0;
-};
 
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
@@ -842,9 +863,11 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
-		SetVulkanObjectNameF(
-		    buffer.GetContext().GetGraphics().device, range.binding.first->Handle(),
-		    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			SetVulkanObjectNameF(
+			    buffer.GetContext().GetGraphics().device, range.binding.first->Handle(),
+			    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
+		}
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -875,10 +898,12 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 
 		prepared.buffers[i] = range->binding.first->Handle();
 		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
-		SetVulkanObjectNameF(
-		    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
-		    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
-		    vertex.addr, size, vertex.stride, vertex.num_records);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			SetVulkanObjectNameF(
+			    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
+			    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
+			    vertex.addr, size, vertex.stride, vertex.num_records);
+		}
 	}
 
 	return prepared;
@@ -1055,14 +1080,16 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}
-	if (source.host_data != nullptr) {
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
-		                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
-		                     static_cast<uint32_t>(source.type));
-	} else {
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
-		                     "Kyty.IndexBuffer[guest=0x{:016x} size=0x{:x} type={}]",
-		                     source.address, source.size, static_cast<uint32_t>(source.type));
+	if (Config::GraphicsDebugDumpEnabled()) {
+		if (source.host_data != nullptr) {
+			SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
+			                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
+			                     static_cast<uint32_t>(source.type));
+		} else {
+			SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
+			                     "Kyty.IndexBuffer[guest=0x{:016x} size=0x{:x} type={}]",
+			                     source.address, source.size, static_cast<uint32_t>(source.type));
+		}
 	}
 	return prepared;
 }
@@ -1266,6 +1293,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	} else if (emit.indirect) {
+		if (!emit.batched) {
+			if (emit.count_buffer != nullptr) {
+				if (emit.indexed) {
+					vk_buffer.drawIndexedIndirectCount(
+					    emit.indirect_buffer, emit.indirect_offset,
+					    emit.count_buffer, emit.count_offset,
+					    emit.draw_count, emit.stride);
+				} else {
+					vk_buffer.drawIndirectCount(
+					    emit.indirect_buffer, emit.indirect_offset,
+					    emit.count_buffer, emit.count_offset,
+					    emit.draw_count, emit.stride);
+				}
+			} else {
+				if (emit.indexed) {
+					vk_buffer.drawIndexedIndirect(
+					    emit.indirect_buffer, emit.indirect_offset,
+					    emit.draw_count, emit.stride);
+				} else {
+					vk_buffer.drawIndirect(
+					    emit.indirect_buffer, emit.indirect_offset,
+					    emit.draw_count, emit.stride);
+				}
+			}
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	}
@@ -1281,8 +1334,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
+	if (shader_write_stages && !emit.batched) {
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
 	LogDrawPhase(draw.name, "DrawComplete");
@@ -1294,6 +1346,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	FlushIndirectBatch();
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1410,6 +1463,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	FlushIndirectBatch();
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1535,6 +1589,339 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;
+}
+
+void RenderExecutor::FlushIndirectBatch() {
+	if (!m_indirect_batch.active || m_indirect_batch.draw_count == 0) {
+		m_indirect_batch.active     = false;
+		m_indirect_batch.draw_count = 0;
+		return;
+	}
+
+	auto vk_buffer = m_indirect_batch.vk_buffer;
+	if (m_indirect_batch.indexed) {
+		vk_buffer.drawIndexedIndirect(
+		    m_indirect_batch.indirect_buffer,
+		    m_indirect_batch.indirect_offset,
+		    m_indirect_batch.draw_count,
+		    m_indirect_batch.stride);
+	} else {
+		vk_buffer.drawIndirect(
+		    m_indirect_batch.indirect_buffer,
+		    m_indirect_batch.indirect_offset,
+		    m_indirect_batch.draw_count,
+		    m_indirect_batch.stride);
+	}
+
+	if (m_indirect_batch.shader_write_stages) {
+		ShaderWriteBarrier(vk_buffer, m_indirect_batch.shader_write_stages);
+	}
+
+	m_indirect_batch.active     = false;
+	m_indirect_batch.draw_count = 0;
+	ResetBindings();
+}
+
+void RenderExecutor::DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                  const DrawIndirectArgs& args) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_IF(buffer.IsInvalid());
+	auto& sh_ctx = buffer.GetShaders();
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return;
+	}
+
+	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ucfg = buffer.GetUserConfig();
+
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
+	                    0, 0, 1, 0, args.args_addr);
+
+	Common::LockGuard lock(m_context.GetMutex());
+
+	const uint32_t arg_size = args.indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+
+	// Check if this indirect draw can be coalesced into the active indirect batch
+	if (m_indirect_batch.active &&
+	    m_indirect_batch.buffer == &buffer &&
+	    m_indirect_batch.indexed == args.indexed &&
+	    m_indirect_batch.stride == arg_size &&
+	    args.args_addr == m_indirect_batch.last_args_addr + arg_size &&
+	    (!args.indexed || (args.index_base_addr == m_indirect_batch.index_base_addr &&
+	                      args.index_type_and_size == m_indirect_batch.index_type_and_size))) {
+		const auto& vs = sh_ctx.GetVs();
+		const auto& ps = sh_ctx.GetPs();
+		const uint32_t vs_count = std::min<uint32_t>(vs.gs_user_sgpr.count, 16u);
+		const uint32_t ps_count = std::min<uint32_t>(ps.ps_user_sgpr.count, 16u);
+		if (vs.es_regs.data_addr == m_indirect_batch.vs_data_addr &&
+		    ps.ps_regs.data_addr == m_indirect_batch.ps_data_addr &&
+		    vs_count == m_indirect_batch.vs_user_sgpr_count &&
+		    ps_count == m_indirect_batch.ps_user_sgpr_count &&
+		    std::memcmp(vs.gs_user_sgpr.value, m_indirect_batch.vs_user_sgpr.data(), vs_count * 4) == 0 &&
+		    std::memcmp(ps.ps_user_sgpr.value, m_indirect_batch.ps_user_sgpr.data(), ps_count * 4) == 0) {
+			m_indirect_batch.draw_count++;
+			m_indirect_batch.last_args_addr = args.args_addr;
+			return;
+		}
+	}
+
+	FlushIndirectBatch();
+
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
+		ResetBindings();
+		return;
+	}
+
+	hw_check(buffer);
+
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, !args.indexed, topology)) {
+		ResetBindings();
+		return;
+	}
+
+	DrawIndexBufferSource index_source {};
+	bool primitive_restart = false;
+	if (args.indexed) {
+		index_source.address = args.index_base_addr;
+		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16:
+				index_source.type               = vk::IndexType::eUint16;
+				index_source.guest_element_size = 2;
+				break;
+			case Prospero::IndexType::kIndex32:
+				index_source.type               = vk::IndexType::eUint32;
+				index_source.guest_element_size = 4;
+				break;
+			case Prospero::IndexType::kIndex8:
+				index_source.guest_element_size = 1;
+				index_source.type               = vk::IndexType::eUint8EXT;
+				break;
+			default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
+		}
+		index_source.size = args.index_buffer_size != 0
+		                        ? static_cast<uint64_t>(args.index_buffer_size) * index_source.guest_element_size
+		                        : 64 * 1024 * 1024;
+		primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+	}
+
+	const DrawCallInfo draw {args.indexed ? "DrawIndexedIndirect" : "DrawIndirect",
+	                         CommandBufferDebugOp::DrawIndex, 0, 0, 0};
+	DrawRenderState state {};
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, true, state)) {
+		ResetBindings();
+		return;
+	}
+
+	RefreshShaders(buffer, draw, args.indexed, state);
+
+	const BufferId cached_id =
+	    (m_last_draw_indirect_args_vaddr == args.args_addr && m_last_draw_indirect_args_id)
+	        ? m_last_draw_indirect_args_id
+	        : m_context.GetBufferCache().FindBuffer(args.args_addr, arg_size);
+	m_last_draw_indirect_args_vaddr = args.args_addr;
+	m_last_draw_indirect_args_id    = cached_id;
+	auto [arg_buffer, arg_offset]   = m_context.GetBufferCache().ObtainBuffer(
+	    args.args_addr, arg_size, false, false, cached_id);
+
+	auto vk_buffer = buffer.Handle();
+	vk::BufferMemoryBarrier barrier {};
+	barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
+	barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite |
+	                              vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = arg_buffer->Handle();
+	barrier.offset              = arg_offset;
+	barrier.size                = VK_WHOLE_SIZE;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect,
+	                          vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+
+	const bool is_stream_buffer = (arg_buffer == &m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream));
+	const bool can_batch = !is_stream_buffer;
+
+	DrawEmitInfo emit {};
+	emit.indexed         = args.indexed;
+	emit.indirect        = true;
+	emit.batched         = can_batch;
+	emit.indirect_buffer = arg_buffer->Handle();
+	emit.indirect_offset = arg_offset;
+	emit.draw_count      = 1;
+	emit.stride          = arg_size;
+
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	                    primitive_restart, true, true, false);
+
+	if (can_batch) {
+		const auto& vs = sh_ctx.GetVs();
+		const auto& ps = sh_ctx.GetPs();
+		const uint32_t vs_count = std::min<uint32_t>(vs.gs_user_sgpr.count, 16u);
+		const uint32_t ps_count = std::min<uint32_t>(ps.ps_user_sgpr.count, 16u);
+		vk::PipelineStageFlags shader_write_stages = {};
+		if (HasShaderBufferWrites(state.vs_input_info.stage)) {
+			shader_write_stages |= vk::PipelineStageFlagBits::eVertexShader;
+		}
+		if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+			shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+		}
+
+		m_indirect_batch.active              = true;
+	m_indirect_batch.submit_id           = submit_id;
+	m_indirect_batch.buffer              = &buffer;
+	m_indirect_batch.vk_buffer           = vk_buffer;
+	m_indirect_batch.indirect_buffer     = arg_buffer->Handle();
+	m_indirect_batch.indirect_offset     = arg_offset;
+	m_indirect_batch.draw_count          = 1;
+	m_indirect_batch.stride              = arg_size;
+	m_indirect_batch.indexed             = args.indexed;
+	m_indirect_batch.last_args_addr      = args.args_addr;
+	m_indirect_batch.shader_write_stages = shader_write_stages;
+	m_indirect_batch.vs_data_addr        = vs.es_regs.data_addr;
+	m_indirect_batch.ps_data_addr        = ps.ps_regs.data_addr;
+	m_indirect_batch.vs_user_sgpr_count  = vs_count;
+	m_indirect_batch.ps_user_sgpr_count  = ps_count;
+	std::memcpy(m_indirect_batch.vs_user_sgpr.data(), vs.gs_user_sgpr.value, vs_count * 4);
+	std::memcpy(m_indirect_batch.ps_user_sgpr.data(), ps.ps_user_sgpr.value, ps_count * 4);
+	m_indirect_batch.index_base_addr     = args.index_base_addr;
+	m_indirect_batch.index_type_and_size = args.index_type_and_size;
+	}
+}
+
+void RenderExecutor::DrawIndirectMulti(uint64_t submit_id, CommandBuffer& buffer,
+                                       const DrawIndirectMultiArgs& args) {
+	KYTY_PROFILER_FUNCTION();
+	FlushIndirectBatch();
+
+	EXIT_IF(buffer.IsInvalid());
+	if (args.max_count_or_count == 0) {
+		return;
+	}
+
+	auto& sh_ctx = buffer.GetShaders();
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return;
+	}
+
+	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& ucfg = buffer.GetUserConfig();
+
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
+	                    0, 0, 1, 0, args.args_addr);
+
+	Common::LockGuard lock(m_context.GetMutex());
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
+		ResetBindings();
+		return;
+	}
+
+	hw_check(buffer);
+
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, !args.indexed, topology)) {
+		ResetBindings();
+		return;
+	}
+
+	DrawIndexBufferSource index_source {};
+	bool primitive_restart = false;
+	if (args.indexed) {
+		index_source.address = args.index_base_addr;
+		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16:
+				index_source.type               = vk::IndexType::eUint16;
+				index_source.guest_element_size = 2;
+				break;
+			case Prospero::IndexType::kIndex32:
+				index_source.type               = vk::IndexType::eUint32;
+				index_source.guest_element_size = 4;
+				break;
+			case Prospero::IndexType::kIndex8:
+				index_source.guest_element_size = 1;
+				index_source.type               = vk::IndexType::eUint8EXT;
+				break;
+			default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
+		}
+		index_source.size = args.index_buffer_size != 0
+		                        ? static_cast<uint64_t>(args.index_buffer_size) * index_source.guest_element_size
+		                        : 64 * 1024 * 1024;
+		primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+	}
+
+	const DrawCallInfo draw {args.indexed ? "DrawIndexedIndirectMulti" : "DrawIndirectMulti",
+	                         CommandBufferDebugOp::DrawIndex, 0, 0, 0};
+	DrawRenderState state {};
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, true, state)) {
+		ResetBindings();
+		return;
+	}
+
+	RefreshShaders(buffer, draw, args.indexed, state);
+
+	const uint32_t arg_size = args.indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+	const uint32_t stride = args.stride_in_bytes != 0 ? args.stride_in_bytes : arg_size;
+	const uint64_t total_args_size = static_cast<uint64_t>(args.max_count_or_count) * stride;
+	const BufferId cached_id =
+	    (m_last_draw_indirect_args_vaddr == args.args_addr && m_last_draw_indirect_args_id)
+	        ? m_last_draw_indirect_args_id
+	        : m_context.GetBufferCache().FindBuffer(args.args_addr, total_args_size);
+	m_last_draw_indirect_args_vaddr = args.args_addr;
+	m_last_draw_indirect_args_id    = cached_id;
+	auto [arg_buffer, arg_offset]   = m_context.GetBufferCache().ObtainBuffer(
+	    args.args_addr, total_args_size, false, false, cached_id);
+
+	auto vk_buffer = buffer.Handle();
+	std::array<vk::BufferMemoryBarrier, 2> barriers {};
+	uint32_t barrier_count = 1;
+
+	barriers[0].sType               = vk::StructureType::eBufferMemoryBarrier;
+	barriers[0].srcAccessMask       = vk::AccessFlagBits::eShaderWrite |
+	                                  vk::AccessFlagBits::eTransferWrite;
+	barriers[0].dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].buffer              = arg_buffer->Handle();
+	barriers[0].offset              = arg_offset;
+	barriers[0].size                = total_args_size;
+
+	DrawEmitInfo emit {};
+	emit.indexed         = args.indexed;
+	emit.indirect        = true;
+	emit.batched         = false;
+	emit.indirect_buffer = arg_buffer->Handle();
+	emit.indirect_offset = arg_offset;
+	emit.draw_count      = args.max_count_or_count;
+	emit.stride          = stride;
+
+	if (args.count_addr != 0) {
+		auto [cnt_buffer, cnt_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args.count_addr, sizeof(uint32_t), false, false, BufferId {});
+		emit.count_buffer = cnt_buffer->Handle();
+		emit.count_offset = cnt_offset;
+
+		barriers[1].sType               = vk::StructureType::eBufferMemoryBarrier;
+		barriers[1].srcAccessMask       = vk::AccessFlagBits::eShaderWrite |
+		                                  vk::AccessFlagBits::eTransferWrite;
+		barriers[1].dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+		barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barriers[1].buffer              = cnt_buffer->Handle();
+		barriers[1].offset              = cnt_offset;
+		barriers[1].size                = sizeof(uint32_t);
+		barrier_count                   = 2;
+	}
+
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect,
+	                          vk::DependencyFlags {}, 0, nullptr, barrier_count, barriers.data(), 0, nullptr);
+
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	                    primitive_restart, true, true, false);
+	ResetBindings();
 }
 
 } // namespace Libs::Graphics

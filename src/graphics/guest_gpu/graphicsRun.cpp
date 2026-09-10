@@ -40,21 +40,6 @@ static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
-struct DrawIndirectArgs {
-	uint32_t vertex_count_per_instance;
-	uint32_t instance_count;
-	uint32_t start_vertex_location;
-	uint32_t start_instance_location;
-};
-
-struct DrawIndexedIndirectArgs {
-	uint32_t index_count_per_instance;
-	uint32_t instance_count;
-	uint32_t start_index_location;
-	uint32_t base_vertex_location;
-	uint32_t start_instance_location;
-};
-
 class GpuMutexLock final {
 public:
 	explicit GpuMutexLock(Common::Mutex& mutex): m_mutex(mutex) {
@@ -906,85 +891,17 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
-	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
-	        m_draw_indirect_args_base_addr + data_offset,
-	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
-		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("DrawIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
-			     " (image-owned range, reading guest memory)\n",
-			     m_draw_indirect_args_base_addr + data_offset);
-		}
-	}
+	CheckBuffer();
 
-	if (!indexed) {
-		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
-		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
-		    args.start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
-				LOGF("\t warning: partial DrawIndirect args: vertex_count=%" PRIu32
-				     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
-				     ", start_instance=%" PRIu32 "\n",
-				     args.vertex_count_per_instance, args.instance_count,
-				     args.start_vertex_location, args.start_instance_location);
-			}
-		}
-		m_num_instances = args.instance_count;
-		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
-		               .instance_count = args.instance_count,
-		               .first_vertex   = args.start_vertex_location,
-		               .first_instance = args.start_instance_location,
-		               .offset_source  = DrawOffsetSource::IndirectArgs});
-		return;
-	}
+	DrawIndirectArgs args {};
+	args.args_addr                  = m_draw_indirect_args_base_addr + data_offset;
+	args.indexed                    = indexed;
+	args.index_type_and_size        = m_index_type_and_size;
+	args.index_base_addr            = m_index_base_addr;
+	args.index_buffer_size          = m_index_buffer_size;
+	args.render_target_slice_offset = 0;
 
-	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
-	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
-			LOGF("\t warning: partial DrawIndexIndirect args: index_count=%" PRIu32
-			     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
-			     ", start_instance=%" PRIu32 "\n",
-			     args.index_count_per_instance, args.instance_count, args.start_index_location,
-			     args.base_vertex_location, args.start_instance_location);
-		}
-	}
-
-	uint64_t index_size = 0;
-	switch (m_index_type_and_size) {
-		case 0: index_size = 2; break;
-		case 1: index_size = 4; break;
-		case 2: index_size = 1; break;
-		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-	}
-
-	auto* index_addr = reinterpret_cast<const void*>(
-	    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
-
-	const uint32_t index_count =
-	    (m_index_buffer_size != 0 ? std::min(args.index_count_per_instance, m_index_buffer_size)
-	                              : args.index_count_per_instance);
-	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-			LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
-			     " using INDEX_BUFFER_SIZE\n",
-			     args.index_count_per_instance, index_count);
-		}
-	}
-
-	m_num_instances = args.instance_count;
-	DrawIndex({.index_count    = index_count,
-	           .index_addr     = index_addr,
-	           .instance_count = args.instance_count,
-	           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
-	           .first_instance = args.start_instance_location,
-	           .offset_source  = DrawOffsetSource::IndirectArgs});
+	m_renderer.GetRenderExecutor().DrawIndirect(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -994,111 +911,24 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	uint32_t draw_count = max_count_or_count;
-	if (count_addr != nullptr) {
-		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
-		                                                  sizeof(uint32_t))) {
-			static std::atomic<uint32_t> sync_fallback_logs {0};
-			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DrawIndirectMulti: failed to synchronise the draw count at 0x%016" PRIx64
-				     " (image-owned range, reading guest memory)\n",
-				     reinterpret_cast<uint64_t>(count_addr));
-			}
-		}
-		draw_count = *count_addr;
-		if (draw_count > max_count_or_count) {
-			draw_count = max_count_or_count;
-		}
-	}
-
-	if (draw_count == 0) {
+	if (max_count_or_count == 0) {
 		return;
 	}
 
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
-	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
-	        m_draw_indirect_args_base_addr + data_offset,
-	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {
-		static std::atomic<uint32_t> sync_fallback_logs {0};
-		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("DrawIndirectMulti: failed to synchronise indirect arguments at 0x%016" PRIx64
-			     " (image-owned range, reading guest memory)\n",
-			     m_draw_indirect_args_base_addr + data_offset);
-		}
-	}
+	CheckBuffer();
 
-	for (uint32_t i = 0; i < draw_count; i++) {
-		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
-		                       static_cast<uint64_t>(i) * stride_in_bytes;
+	DrawIndirectMultiArgs args {};
+	args.args_addr                  = m_draw_indirect_args_base_addr + data_offset;
+	args.max_count_or_count         = max_count_or_count;
+	args.count_addr                 = reinterpret_cast<uint64_t>(count_addr);
+	args.stride_in_bytes            = stride_in_bytes;
+	args.indexed                    = indexed;
+	args.index_type_and_size        = m_index_type_and_size;
+	args.index_base_addr            = m_index_base_addr;
+	args.index_buffer_size          = m_index_buffer_size;
+	args.render_target_slice_offset = 0;
 
-		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			if (args->instance_count != 1u || args->start_vertex_location != 0u ||
-			    args->start_instance_location != 0u) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
-					LOGF("\t warning: partial DrawIndirectMulti args[%u]: vertex_count=%" PRIu32
-					     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
-					     ", start_instance=%" PRIu32 "\n",
-					     i, args->vertex_count_per_instance, args->instance_count,
-					     args->start_vertex_location, args->start_instance_location);
-				}
-			}
-			m_num_instances = args->instance_count;
-			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
-			               .instance_count = args->instance_count,
-			               .first_vertex   = args->start_vertex_location,
-			               .first_instance = args->start_instance_location,
-			               .offset_source  = DrawOffsetSource::IndirectArgs});
-			continue;
-		}
-
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
-		if (args->base_vertex_location != 0u || args->start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
-				LOGF("\t warning: partial DrawIndexIndirectMulti args[%u]: index_count=%" PRIu32
-				     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
-				     ", start_instance=%" PRIu32 "\n",
-				     i, args->index_count_per_instance, args->instance_count,
-				     args->start_index_location, args->base_vertex_location,
-				     args->start_instance_location);
-			}
-		}
-
-		uint64_t index_size = 0;
-		switch (m_index_type_and_size) {
-			case 0: index_size = 2; break;
-			case 1: index_size = 4; break;
-			case 2: index_size = 1; break;
-			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-		}
-
-		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
-
-		const uint32_t index_count =
-		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
-				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
-			}
-		}
-
-		m_num_instances = args->instance_count;
-		DrawIndex({.index_count    = index_count,
-		           .index_addr     = index_addr,
-		           .instance_count = args->instance_count,
-		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
-		           .first_instance = args->start_instance_location,
-		           .offset_source  = DrawOffsetSource::IndirectArgs});
-	}
+	m_renderer.GetRenderExecutor().DrawIndirectMulti(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
@@ -1480,16 +1310,22 @@ void CommandProcessor::EmitGlobalBarrier() {
 
 	Common::LockGuard lock(m_renderer.GetMutex());
 
+	if (GetScheduler().IsRendering()) {
+		GetScheduler().EndRendering();
+	}
+
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader |
+	                        vk::PipelineStageFlagBits2::eAllGraphics |
+	                        vk::PipelineStageFlagBits2::eTransfer |
+	                        vk::PipelineStageFlagBits2::eDrawIndirect;
 	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 

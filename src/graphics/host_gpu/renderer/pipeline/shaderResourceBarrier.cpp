@@ -34,7 +34,8 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
-	                        vk::AccessFlagBits::eColorAttachmentWrite;
+	                        vk::AccessFlagBits::eColorAttachmentWrite |
+	                        vk::AccessFlagBits::eIndirectCommandRead;
 	return barrier;
 }
 
