@@ -36,6 +36,20 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+RenderExecutor::RenderExecutor(RenderContext& context) : m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
+
+void RenderExecutor::OnCommandBufferBegin() {
+	m_dynamic_state_cache.Invalidate();
+	m_last_indirect_args_vaddr        = 0;
+	m_last_indirect_args_id           = {};
+	m_last_draw_indirect_args_vaddr   = 0;
+	m_last_draw_indirect_args_id      = {};
+	m_indirect_batch                  = {};
+}
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -288,6 +302,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode,
                                     uint64_t indirect_args) {
+	KYTY_PROFILER_FUNCTION();
+
+	FlushIndirectBatch();
+
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -336,9 +354,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
 	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
@@ -459,7 +477,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	buffer.EndRendering();
+	if (buffer.IsRendering()) {
+		buffer.EndRendering();
+	}
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	PrepareBindings(input_info.stage, m_compute_bindings);
@@ -474,6 +494,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &m_compute_bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -484,8 +505,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                }) ||
 	    has_storage_writes;
 	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
@@ -511,7 +530,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 
-	// Read-only dispatches need ordering, but no memory visibility operation.
 	const bool writes_memory =
 	    has_storage_writes || program.info.uses_dma || m_compute_bindings.gds.buffer != nullptr ||
 	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
@@ -522,5 +540,4 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 	m_context.GetCommandScheduler().PopPendingOperations();
 }
-
 } // namespace Libs::Graphics
