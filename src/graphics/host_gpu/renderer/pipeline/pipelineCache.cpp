@@ -240,10 +240,6 @@ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
 	}
 }
 
-bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
-	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
-}
-
 bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 	// A GPU-written neighbour may protect a clean descriptor on the same page.
 	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
@@ -257,20 +253,6 @@ bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
 bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
 	return count >= 2 && count <= 16 &&
 	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
-}
-
-void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
-                           const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
-	if (!ok) {
-		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
-		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
-	}
-	if (!report.dropped_summary.empty()) {
-		LOGF("%s indirect image tables: hash=0x%016" PRIx64 " dropped=%" PRIu32 " shapes=%" PRIu32
-		     "%s\n",
-		     label, hash, report.dropped_candidates, report.dropped_shapes,
-		     report.dropped_summary.c_str());
-	}
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

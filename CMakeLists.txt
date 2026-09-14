@@ -83,6 +83,7 @@ if(LINUX OR APPLE)
 	set(KYTY_PLATFORM KYTY_PLATFORM_LINUX)
 else()
 	set(KYTY_PLATFORM KYTY_PLATFORM_WINDOWS)
+	add_compile_definitions(NOMINMAX)
 endif()
 
 set(CLANG FALSE)

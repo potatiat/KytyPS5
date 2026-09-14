@@ -107,6 +107,8 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] const RenderState& GetRenderState() const noexcept { return m_render_state; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
