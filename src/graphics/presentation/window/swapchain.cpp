@@ -792,6 +792,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
+		if (m_impl->renderer.GetPipelineCache().NewPipelinesSinceSave() >= 256) {
+			m_impl->renderer.GetPipelineCache().FlushDriverCache();
+		}
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

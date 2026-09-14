@@ -111,7 +111,7 @@ public:
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
 #if defined(_WIN32)
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	QStringList host_input_mapping;
 

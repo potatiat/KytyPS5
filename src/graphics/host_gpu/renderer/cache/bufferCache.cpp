@@ -664,6 +664,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	if (m_gpu_modified_ranges.Empty()) {
+		return false;
+	}
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
@@ -671,18 +674,18 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::RunGarbageCollector() {
+void BufferCache::RunGarbageCollector(bool force) {
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (!force && m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
-	const size_t   limit      = aggressive ? 64 : 32;
+	const bool     aggressive = force || m_total_used_memory >= m_critical_gc_memory;
+	const uint64_t age        = force ? 0 : std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const size_t   limit      = force ? 128 : aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	std::vector<DownloadCopy> copies;

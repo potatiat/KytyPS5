@@ -306,9 +306,21 @@ LIB_NAME("SaveDataDialog", "SaveDataDialog");
 
 constexpr int SAVE_STATUS_NONE        = 0;
 constexpr int SAVE_STATUS_INITIALIZED = 1;
+constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
-constexpr int SAVE_RESULT_OK          = 0;
-constexpr int SAVE_BUTTON_ID_OK       = 1;
+constexpr int SAVE_RESULT_OK            = 0;
+constexpr int SAVE_RESULT_USER_CANCELED = 1;
+constexpr int SAVE_BUTTON_ID_INVALID    = 0;
+constexpr int SAVE_BUTTON_ID_OK         = 1;
+constexpr int SAVE_MODE_PROGRESS_BAR    = 5;
+constexpr int SAVE_DISP_TYPE_SAVE       = 1;
+constexpr uint32_t SAVE_SYSMSG_NODATA                = 1;
+constexpr uint32_t SAVE_SYSMSG_NOSPACE               = 4;
+constexpr uint32_t SAVE_SYSMSG_NOSPACE_CONTINUABLE   = 6;
+constexpr int SAVE_ERROR_NOT_INITIALIZED = static_cast<int>(0x80B80003u);
+constexpr int SAVE_ERROR_NOT_FINISHED    = static_cast<int>(0x80B80005u);
+constexpr int SAVE_ERROR_INVALID_STATE   = static_cast<int>(0x80B80006u);
+constexpr int SAVE_ERROR_ARG_NULL        = static_cast<int>(0x80B8000Du);
 
 struct SaveDataDialogParam {
 	uint8_t  base_param[48];
@@ -338,6 +350,14 @@ struct SaveDataDialogItems {
 	const void*            title_id;
 	const SaveDataDirName* dir_names;
 	uint32_t               dir_names_num;
+	int32_t                pad1;
+	const void*            new_item;
+};
+
+struct SaveDataDialogSystemMessageParam {
+	uint32_t msg_type;
+	uint32_t pad;
+	uint64_t value;
 };
 
 struct SaveDataDialogResult {
@@ -351,16 +371,47 @@ struct SaveDataDialogResult {
 	uint8_t  reserved[32];
 };
 
-static int   g_save_status    = SAVE_STATUS_NONE;
-static int   g_save_mode      = 0;
-static void* g_save_user_data = nullptr;
-static char  g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static int      g_save_status    = SAVE_STATUS_NONE;
+static int      g_save_mode      = 0;
+static int      g_save_disp_type = 0;
+static int      g_save_result    = SAVE_RESULT_OK;
+static int      g_save_button    = SAVE_BUTTON_ID_OK;
+static uint32_t g_save_sys_msg   = 0;
+static void*    g_save_user_data = nullptr;
+static char     g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+
+void CopySaveDirName(const SaveDataDialogItems* items) {
+	g_save_dir_name[0] = '\0';
+	if (items != nullptr && items->dir_names != nullptr) {
+		for (uint32_t i = 0; i < items->dir_names_num; i++) {
+			const auto* name = items->dir_names[i].data;
+			if (name[0] != '\0') {
+				std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s", name);
+				return;
+			}
+		}
+	}
+	if (g_save_disp_type == SAVE_DISP_TYPE_SAVE) {
+		std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "SAVEDATA0");
+	}
+}
+
+int FinishIfIdle() {
+	if (g_save_status == SAVE_STATUS_RUNNING && g_save_mode != SAVE_MODE_PROGRESS_BAR) {
+		g_save_status = SAVE_STATUS_FINISHED;
+	}
+	return g_save_status;
+}
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
 
 	g_save_status      = SAVE_STATUS_INITIALIZED;
 	g_save_mode        = 0;
+	g_save_disp_type   = 0;
+	g_save_result      = SAVE_RESULT_OK;
+	g_save_button      = SAVE_BUTTON_ID_OK;
+	g_save_sys_msg     = 0;
 	g_save_user_data   = nullptr;
 	g_save_dir_name[0] = '\0';
 
@@ -376,22 +427,36 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
-	return g_save_status;
+	return FinishIfIdle();
 }
 
 int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 	PRINT_NAME();
 
-	if (result != nullptr) {
-		auto* r      = static_cast<SaveDataDialogResult*>(result);
-		r->mode      = g_save_mode;
-		r->result    = SAVE_RESULT_OK;
-		r->button_id = SAVE_BUTTON_ID_OK;
-		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
-			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
-			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
-		}
+	if (result == nullptr) {
+		return SAVE_ERROR_ARG_NULL;
+	}
+	FinishIfIdle();
+	if (g_save_status != SAVE_STATUS_FINISHED) {
+		return SAVE_ERROR_NOT_FINISHED;
+	}
+	auto* r      = static_cast<SaveDataDialogResult*>(result);
+	r->mode      = g_save_mode;
+	r->result    = g_save_result;
+	r->button_id = g_save_button;
+	r->user_data = g_save_user_data;
+	if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
+		std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
+		              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
+	}
+
+	static uint32_t s_get_result_n = 0;
+	s_get_result_n++;
+	if (s_get_result_n <= 8u || (s_get_result_n % 100000u) == 0u) {
+		LOGF("[DBG-s500] SaveDataDialogGetResult n=%" PRIu32 " status=%d mode=%d result=%d "
+		     "sys_msg=%u dir=%s\n",
+		     s_get_result_n, g_save_status, g_save_mode, g_save_result, g_save_sys_msg,
+		     g_save_dir_name);
 	}
 
 	return OK;
@@ -400,38 +465,61 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	PRINT_NAME();
 
-	const auto* p = static_cast<const SaveDataDialogParam*>(param);
-	if (p != nullptr) {
-		g_save_mode        = p->mode;
-		g_save_user_data   = p->user_data;
-		g_save_dir_name[0] = '\0';
-		LOGF("\t size           = %d\n"
-		     "\t mode           = %d\n"
-		     "\t disp_type      = %d\n"
-		     "\t items          = 0x%016" PRIx64 "\n"
-		     "\t user_msg_param = 0x%016" PRIx64 "\n"
-		     "\t sys_msg_param  = 0x%016" PRIx64 "\n"
-		     "\t prog_bar_param = 0x%016" PRIx64 "\n"
-		     "\t user_data      = 0x%016" PRIx64 "\n",
-		     p->size, p->mode, p->disp_type, reinterpret_cast<uint64_t>(p->items),
-		     reinterpret_cast<uint64_t>(p->user_msg_param),
-		     reinterpret_cast<uint64_t>(p->sys_msg_param),
-		     reinterpret_cast<uint64_t>(p->prog_bar_param),
-		     reinterpret_cast<uint64_t>(p->user_data));
-
-		const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
-		if (items != nullptr && items->dir_names != nullptr) {
-			for (uint32_t i = 0; i < items->dir_names_num; i++) {
-				const auto* name = items->dir_names[i].data;
-				if (name[0] != '\0') {
-					std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s", name);
-					break;
-				}
-			}
-		}
+	if (param == nullptr) {
+		return SAVE_ERROR_ARG_NULL;
+	}
+	if (g_save_status == SAVE_STATUS_NONE) {
+		return SAVE_ERROR_NOT_INITIALIZED;
+	}
+	if (g_save_status != SAVE_STATUS_INITIALIZED && g_save_status != SAVE_STATUS_FINISHED) {
+		return SAVE_ERROR_INVALID_STATE;
 	}
 
-	g_save_status = SAVE_STATUS_FINISHED;
+	const auto* p      = static_cast<const SaveDataDialogParam*>(param);
+	g_save_mode        = p->mode;
+	g_save_disp_type   = p->disp_type;
+	g_save_user_data   = p->user_data;
+	const auto* items  = static_cast<const SaveDataDialogItems*>(p->items);
+	const auto* sysmsg = static_cast<const SaveDataDialogSystemMessageParam*>(p->sys_msg_param);
+	CopySaveDirName(items);
+	g_save_sys_msg = sysmsg != nullptr ? sysmsg->msg_type : 0u;
+	const bool cancel_msg =
+	    (g_save_sys_msg == SAVE_SYSMSG_NODATA || g_save_sys_msg == SAVE_SYSMSG_NOSPACE ||
+	     g_save_sys_msg == SAVE_SYSMSG_NOSPACE_CONTINUABLE);
+	g_save_result = cancel_msg ? SAVE_RESULT_USER_CANCELED : SAVE_RESULT_OK;
+	g_save_button = cancel_msg ? SAVE_BUTTON_ID_INVALID : SAVE_BUTTON_ID_OK;
+	LOGF("\t size           = %d\n"
+	     "\t mode           = %d\n"
+	     "\t disp_type      = %d\n"
+	     "\t items          = 0x%016" PRIx64 "\n"
+	     "\t dir_names_num  = %" PRIu32 "\n"
+	     "\t dir_name       = %s\n"
+	     "\t sys_msg_type   = %u\n"
+	     "\t sys_msg_value  = %" PRIu64 "\n"
+	     "\t result         = %d\n"
+	     "\t user_msg_param = 0x%016" PRIx64 "\n"
+	     "\t sys_msg_param  = 0x%016" PRIx64 "\n"
+	     "\t prog_bar_param = 0x%016" PRIx64 "\n"
+	     "\t user_data      = 0x%016" PRIx64 "\n",
+	     p->size, p->mode, p->disp_type, reinterpret_cast<uint64_t>(p->items),
+	     items != nullptr ? items->dir_names_num : 0u,
+	     g_save_dir_name[0] != '\0' ? g_save_dir_name : "<none>", g_save_sys_msg,
+	     sysmsg != nullptr ? sysmsg->value : 0ull, g_save_result,
+	     reinterpret_cast<uint64_t>(p->user_msg_param),
+	     reinterpret_cast<uint64_t>(p->sys_msg_param),
+	     reinterpret_cast<uint64_t>(p->prog_bar_param),
+	     reinterpret_cast<uint64_t>(p->user_data));
+
+	g_save_status = SAVE_STATUS_RUNNING;
+
+	static uint32_t s_open_n = 0;
+	s_open_n++;
+	if (s_open_n <= 8u || (s_open_n % 100000u) == 0u) {
+		LOGF("[DBG-s500] SaveDataDialogOpen n=%" PRIu32 " mode=%d disp=%d sys_msg=%u value=%" PRIu64
+		     " result=%d dir=%s\n",
+		     s_open_n, g_save_mode, g_save_disp_type, g_save_sys_msg,
+		     sysmsg != nullptr ? sysmsg->value : 0ull, g_save_result, g_save_dir_name);
+	}
 
 	return OK;
 }
@@ -457,6 +545,10 @@ int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 
 	g_save_status      = SAVE_STATUS_NONE;
 	g_save_mode        = 0;
+	g_save_disp_type   = 0;
+	g_save_result      = SAVE_RESULT_OK;
+	g_save_button      = SAVE_BUTTON_ID_OK;
+	g_save_sys_msg     = 0;
 	g_save_user_data   = nullptr;
 	g_save_dir_name[0] = '\0';
 

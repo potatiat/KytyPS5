@@ -1260,6 +1260,32 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			}
 		}
 	}
+
+	// Demon's Souls (PPSA01341): GITreeManager null dereference guard.
+	// When GI trees are disabled or uninitialized, GITreeManager calls accessor at 0x9a35a0
+	// with rdi = nullptr, executing `mov eax, [rdi + 0x38]` (faulting at address 0x38).
+	// Patch with null check:
+	//   test rdi, rdi; jz null_ret; mov eax, [rdi + 0x38]; ret; null_ret: xor eax, eax; ret;
+	if (program->elf != nullptr && !program->elf->IsShared()) {
+		const uint64_t target_vaddr = program->base_vaddr + 0x9a35a0;
+		if (target_vaddr >= address && target_vaddr + 16 <= address + size) {
+			auto* code_ptr = reinterpret_cast<uint8_t*>(target_vaddr);
+			const uint8_t orig_bytes[4] = {0x8b, 0x47, 0x38, 0xc3};
+			if (std::memcmp(code_ptr, orig_bytes, sizeof(orig_bytes)) == 0) {
+				const uint8_t patch_bytes[12] = {
+					0x48, 0x85, 0xff,       // test rdi, rdi
+					0x74, 0x04,             // jz +4 (to xor eax, eax; ret)
+					0x8b, 0x47, 0x38,       // mov eax, [rdi + 0x38]
+					0xc3,                   // ret
+					0x31, 0xc0,             // xor eax, eax
+					0xc3                    // ret
+				};
+				std::memcpy(code_ptr, patch_bytes, sizeof(patch_bytes));
+				LOGF("PatchProgram: applied Demon's Souls null-dereference guard at [0x%016" PRIx64 "]\n",
+				     target_vaddr);
+			}
+		}
+	}
 }
 
 uint64_t RuntimeLinker::GetEntry() {

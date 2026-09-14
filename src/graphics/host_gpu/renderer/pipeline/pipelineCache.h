@@ -5,16 +5,21 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/compilerPool.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -113,6 +118,10 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	void FlushDriverCache();
+	[[nodiscard]] uint32_t NewPipelinesSinceSave() const noexcept {
+		return m_new_pipelines_since_save.load(std::memory_order_relaxed);
+	}
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -125,6 +134,27 @@ public:
 		ShaderProgram vertex;
 		ShaderProgram pixel;
 	};
+
+	struct ManifestBinding {
+		uint32_t binding          = 0;
+		uint32_t descriptor_type  = 0;
+		uint32_t descriptor_count = 0;
+		uint32_t stage_flags      = 0;
+
+		bool operator==(const ManifestBinding&) const = default;
+	};
+
+	struct ManifestComputeRecord {
+		uint64_t                     shader_id = 0;
+		uint32_t                     wave_size = 0;
+		std::vector<ManifestBinding> bindings;
+		std::vector<uint32_t>        spirv;
+	};
+
+	static void SerializeManifest(
+	    const std::filesystem::path& path,
+	    const std::string& signature,
+	    const std::vector<ManifestComputeRecord>& records);
 
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
@@ -213,19 +243,59 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
-	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	std::unordered_map<uint64_t, std::shared_ptr<Pipeline>> m_compute_pipelines;
+	CompilerThreadPool                                      m_compiler_pool;
+	std::unordered_map<uint64_t, std::shared_future<std::shared_ptr<Pipeline>>>
+	                      m_in_flight_compute;
+	Common::Mutex         m_mutex;
+	struct ComputeFastCacheEntry {
+		uint64_t  id       = 0;
+		Pipeline* pipeline = nullptr;
+	};
+	static constexpr size_t COMPUTE_FAST_CACHE_WAYS = 4;
+	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 4096;
+	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = COMPUTE_FAST_CACHE_SETS * COMPUTE_FAST_CACHE_WAYS;
+	std::array<ComputeFastCacheEntry, COMPUTE_FAST_CACHE_SIZE> m_compute_fast_cache {};
+
+	struct GraphicsMruEntry {
+		uint64_t            vs_id    = 0;
+		uint64_t            ps_id    = 0;
+		GraphicsPipelineKey key {};
+		Pipeline*           pipeline = nullptr;
+	};
+	static constexpr size_t GRAPHICS_MRU_SIZE = 64;
+	std::array<GraphicsMruEntry, GRAPHICS_MRU_SIZE> m_graphics_mru {};
+	std::atomic<uint32_t> m_new_pipelines_since_save {0};
+
+	std::unordered_map<uint64_t, ManifestComputeRecord> m_manifest_records;
+	std::filesystem::path                               m_manifest_path;
 
 	void InitializeDriverCache();
+	void PreloadPipelines();
+	void SubmitSpeculativeComputeLocked(const ShaderProgram& handle,
+	                                    const ShaderComputeInputInfo& input_info);
+	void RecordManifestComputeLocked(uint64_t shader_id, uint32_t wave_size,
+	                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                 std::span<const uint32_t> spirv);
+	void SaveDriverCacheLocked(bool destroy_cache);
+	void SaveManifestLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+                       const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                       vk::ShaderStageFlagBits              stage);
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache);
+void CreateComputePipelineDirect(
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    vk::ShaderModule compute_module, uint32_t wave_size,
+    std::span<const vk::DescriptorSetLayoutBinding> layout_bindings,
+    vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
