@@ -30,7 +30,7 @@ void* KYTY_SYSV_ABI Bridge(void* to, const void* from, size_t size) {
 int main() {
 	using namespace Loader::DemonsSoulsCopy;
 	for (const size_t size:
-	     {size_t {0}, size_t {17}, size_t {65535}, size_t {65536}, size_t {300000}})
+	     {size_t {0}, size_t {17}, size_t {262143}, size_t {262144}, size_t {300000}})
 		for (const size_t displacement: {size_t {0}, size_t {1}, size_t {31}, size_t {400000}})
 			for (const bool reverse: {false, true})
 				for (const bool prepare_accepts: {false, true}) {
@@ -46,7 +46,7 @@ int main() {
 					Check(Bridge(actual.data() + destination, actual.data() + source, size) ==
 					      actual.data() + destination);
 					Check(actual == expected);
-					Check(calls == uint64_t(size >= 65536 && displacement != 0));
+					Check(calls == uint64_t(size >= 262144 && displacement != 0));
 					if (calls)
 						Check(prepared_address ==
 						          reinterpret_cast<uint64_t>(actual.data() + destination) &&
