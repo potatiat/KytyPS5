@@ -36,7 +36,7 @@ inline bool Matches(std::span<const uint8_t> call, std::span<const uint8_t> poll
 // The poll's observable register state is retained even on the idle path.
 // In particular this is not an ordinary C++ function replacement: its caller
 // may rely on registers the original poll was known not to modify.
-inline void EmitThunk(Xbyak::CodeGenerator& c, const void* poll, const void* sleep) {
+inline void EmitThunk(Xbyak::CodeGenerator& c, const void* poll, const void* backoff) {
 	using namespace Xbyak::util;
 	Xbyak::Label done;
 	c.sub(rsp, 8);
@@ -51,8 +51,8 @@ inline void EmitThunk(Xbyak::CodeGenerator& c, const void* poll, const void* sle
 	c.sub(rsp, 520);
 	constexpr uint8_t save_fp[] {0x48, 0x0f, 0xae, 0x04, 0x24}; // FXSAVE64 [rsp]
 	c.db(save_fp, sizeof(save_fp));
-	c.mov(rax, reinterpret_cast<uint64_t>(sleep));
-	c.call(rax); // Explicit SysV callback bridges to the platform sleep API.
+	c.mov(rax, reinterpret_cast<uint64_t>(backoff));
+	c.call(rax); // Explicit SysV callback bridges to the user-mode adaptive backoff handler.
 	c.fxrstor64(ptr[rsp]);
 	c.add(rsp, 520);
 	for (const auto& reg: {r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
