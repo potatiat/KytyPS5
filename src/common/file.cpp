@@ -212,6 +212,14 @@ void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	}
 }
 
+void File::ReadAt(void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read) {
+	EXIT_IF(m_p->f == nullptr);
+
+	if (m_p->f != nullptr) {
+		SysFileReadAt(data, size, offset, *m_p->f, bytes_read);
+	}
+}
+
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {
 	EXIT_IF(m_p->f == nullptr);
 
