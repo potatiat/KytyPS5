@@ -1248,10 +1248,21 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		if (!emit.direct_run.empty()) {
-			for (const auto& item : emit.direct_run)
-				vk_buffer.drawIndexed(item.indexCount, item.instanceCount, item.firstIndex,
-				                      item.vertexOffset, item.firstInstance);
-		} else EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+			if (emit.direct_run.size() > 1) {
+				auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+				const auto stream_offset =
+				    stream.Copy(emit.direct_run.data(), emit.direct_run.size_bytes(), 4);
+				vk_buffer.drawIndexedIndirect(stream.Handle(), stream_offset,
+				                              static_cast<uint32_t>(emit.direct_run.size()),
+				                              sizeof(vk::DrawIndexedIndirectCommand));
+			} else {
+				vk_buffer.drawIndexed(emit.direct_run[0].indexCount, emit.direct_run[0].instanceCount,
+				                      emit.direct_run[0].firstIndex, emit.direct_run[0].vertexOffset,
+				                      emit.direct_run[0].firstInstance);
+			}
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		}
 	}
 
 	if (set_auto_debug) {

@@ -62,6 +62,31 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceFeatures WindowContext::RequiredVulkan10Features() noexcept {
+	vk::PhysicalDeviceFeatures features {};
+	features.multiDrawIndirect        = VK_TRUE;
+	features.fragmentStoresAndAtomics = VK_TRUE;
+	features.samplerAnisotropy        = VK_TRUE;
+	features.robustBufferAccess       = VK_TRUE;
+#if !defined(__APPLE__)
+	features.depthBounds = VK_TRUE; // unsupported by MoltenVK
+#endif
+	features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	features.shaderImageGatherExtended            = VK_TRUE;
+	features.independentBlend                     = VK_TRUE;
+	features.tessellationShader                   = VK_TRUE;
+	features.sampleRateShading                    = VK_TRUE;
+	features.depthBiasClamp                       = VK_TRUE;
+	features.shaderClipDistance                   = VK_TRUE;
+	features.shaderCullDistance                   = VK_TRUE;
+	features.largePoints                          = VK_TRUE;
+	features.multiViewport                        = VK_TRUE;
+	features.fillModeNonSolid                     = VK_TRUE;
+	features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	features.shaderInt64                          = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.sType                     = vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -722,28 +747,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
-	vk::PhysicalDeviceFeatures device_features {};
-	device_features.multiDrawIndirect        = VK_TRUE;
-	device_features.fragmentStoresAndAtomics = VK_TRUE;
-	device_features.samplerAnisotropy        = VK_TRUE;
-	device_features.robustBufferAccess       = VK_TRUE;
-#if !defined(__APPLE__)
-	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
-#endif
-	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.independentBlend                     = VK_TRUE;
-	device_features.tessellationShader                   = VK_TRUE;
-	device_features.sampleRateShading                    = VK_TRUE;
-	device_features.depthBiasClamp                       = VK_TRUE;
-	device_features.shaderClipDistance                   = VK_TRUE;
-	device_features.shaderCullDistance                   = VK_TRUE;
-	device_features.largePoints                          = VK_TRUE;
-	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = VK_TRUE;
-	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
-	graphics.sample_rate_shading_enabled                 = true;
-	device_features.shaderInt64 = VK_TRUE;
+	vk::PhysicalDeviceFeatures device_features           = WindowContext::RequiredVulkan10Features();
+	graphics.sample_rate_shading_enabled                 = (device_features.sampleRateShading == VK_TRUE);
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
