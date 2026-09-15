@@ -482,8 +482,8 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime input_runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
-		    .userdata                   = &read_cache,
 		    .read_memory                = ReadShaderRawGuestMemory,
+		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
 		    .sync_memory                = SyncShaderGuestMemory,
@@ -869,44 +869,44 @@ void PipelineCache::FlushDriverCache() {
 	m_new_pipelines_since_save.store(0, std::memory_order_relaxed);
 
 	std::vector<ManifestComputeRecord> manifest_records;
+	std::vector<uint8_t>               payload;
+	size_t                             payload_size = 0;
 	{
 		Common::LockGuard lock(m_mutex);
 		manifest_records.reserve(m_manifest_records.size());
 		for (const auto& [id, rec]: m_manifest_records) {
 			manifest_records.push_back(rec);
 		}
+
+		// Vulkan 1.3 spec Section 9.6: "Host access to pipelineCache must be externally synchronized"
+		// for vkGetPipelineCacheData. Query data safely while holding m_mutex so no concurrent
+		// pipeline creation occurs on driver_cache.
+		size_t     size   = 0;
+		vk::Result result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		if (result == vk::Result::eSuccess && size > 0 &&
+		    size <= std::numeric_limits<uint32_t>::max()) {
+			payload.resize(size);
+			result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+			if (result == vk::Result::eSuccess) {
+				payload.resize(size);
+				payload_size = size;
+			} else {
+				payload.clear();
+			}
+		}
+	}
+
+	if (payload.empty()) {
+		s_driver_cache_saving.store(false, std::memory_order_release);
+		return;
 	}
 
 	std::thread([dest = m_driver_cache_path,
 	             manifest_dest = m_manifest_path,
 	             records = std::move(manifest_records),
 	             props = m_graphics.GetPhysicalDeviceProperties(),
-	             device = m_graphics.device,
-	             driver_cache = m_driver_cache]() {
-		size_t               size = 0;
-		vk::Result           result = vk::Result::eSuccess;
-		std::vector<uint8_t> payload;
-		for (uint32_t attempt = 0; attempt < 3; attempt++) {
-			size   = 0;
-			result = device.getPipelineCacheData(driver_cache, &size, nullptr);
-			if (result != vk::Result::eSuccess || size == 0 ||
-			    size > std::numeric_limits<uint32_t>::max()) {
-				break;
-			}
-			payload.resize(size);
-			result = device.getPipelineCacheData(driver_cache, &size, payload.data());
-			if (result != vk::Result::eIncomplete) {
-				break;
-			}
-		}
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
-			PipelineCacheLog("Vulkan pipeline cache: background save failed ({}, {} bytes)",
-			                 vk::to_string(result), size);
-			s_driver_cache_saving.store(false, std::memory_order_release);
-			return;
-		}
-		payload.resize(size);
+	             payload = std::move(payload),
+	             size = payload_size]() {
 		const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 		if (payload_hash != s_last_saved_hash.load(std::memory_order_relaxed)) {
 			auto prefix = DriverCacheSignature(props);
@@ -1188,9 +1188,11 @@ void PipelineCache::PreloadPipelines() {
 			                          (COMPUTE_FAST_CACHE_SETS - 1u)) *
 			    COMPUTE_FAST_CACHE_WAYS;
 			for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
-				if (m_compute_fast_cache[set + i].pipeline == nullptr ||
-				    m_compute_fast_cache[set + i].id == id) {
-					m_compute_fast_cache[set + i] = {.id = id, .pipeline = pipeline.get()};
+				const size_t slot = set + i;
+				if (m_compute_fast_cache[slot].pipeline.load(std::memory_order_relaxed) == nullptr ||
+				    m_compute_fast_cache[slot].id.load(std::memory_order_relaxed) == id) {
+					m_compute_fast_cache[slot].pipeline.store(pipeline.get(), std::memory_order_relaxed);
+					m_compute_fast_cache[slot].id.store(id, std::memory_order_release);
 					break;
 				}
 			}
@@ -1471,20 +1473,14 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
-	// Fast-path: 16-entry MRU scan
-	for (size_t i = 0; i < GRAPHICS_MRU_SIZE; i++) {
-		if (m_graphics_mru[i].vs_id == vs_id && m_graphics_mru[i].ps_id == ps_id &&
-		    m_graphics_mru[i].pipeline != nullptr) {
-			if (m_graphics_mru[i].key == key) {
-				auto* hit_pipeline = m_graphics_mru[i].pipeline;
-				if (i > 0) {
-					auto hit_entry = std::move(m_graphics_mru[i]);
-					for (size_t j = i; j > 0; j--) {
-						m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
-					}
-					m_graphics_mru[0] = std::move(hit_entry);
-				}
-				return *hit_pipeline;
+	// Thread-local front cache: 8 entries (~4 KB, fits L1D, zero lock contention and zero data race)
+	thread_local ThreadLocalGraphicsCache tl_graphics_cache;
+
+	for (size_t i = 0; i < ThreadLocalGraphicsCache::SIZE; i++) {
+		auto& entry = tl_graphics_cache.entries[i];
+		if (entry.vs_id == vs_id && entry.ps_id == ps_id && entry.pipeline != nullptr) {
+			if (entry.key == key) {
+				return *entry.pipeline;
 			}
 		}
 	}
@@ -1492,16 +1488,15 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	Common::LockGuard lock(m_mutex);
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		for (size_t j = GRAPHICS_MRU_SIZE - 1; j > 0; j--) {
-			m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
-		}
-		m_graphics_mru[0] = {
+		auto* res = iter->second.get();
+		auto& slot = tl_graphics_cache.entries[tl_graphics_cache.victim++ % ThreadLocalGraphicsCache::SIZE];
+		slot = {
 		    .vs_id    = vs_id,
 		    .ps_id    = ps_id,
 		    .key      = iter->first,
-		    .pipeline = iter->second.get(),
+		    .pipeline = res,
 		};
-		return *iter->second;
+		return *res;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1527,19 +1522,18 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
 
-	for (size_t j = GRAPHICS_MRU_SIZE - 1; j > 0; j--) {
-		m_graphics_mru[j] = std::move(m_graphics_mru[j - 1]);
-	}
-	m_graphics_mru[0] = {
+	auto* res = iter->second.get();
+	auto& slot = tl_graphics_cache.entries[tl_graphics_cache.victim++ % ThreadLocalGraphicsCache::SIZE];
+	slot = {
 	    .vs_id    = vs_id,
 	    .ps_id    = ps_id,
 	    .key      = iter->first,
-	    .pipeline = iter->second.get(),
+	    .pipeline = res,
 	};
 
 	m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);
 
-	return *iter->second;
+	return *res;
 }
 
 PipelineCache::Pipeline&
@@ -1555,8 +1549,9 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                          (COMPUTE_FAST_CACHE_SETS - 1u)) *
 	    COMPUTE_FAST_CACHE_WAYS;
 	for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
-		if (m_compute_fast_cache[set + i].id == id && m_compute_fast_cache[set + i].pipeline != nullptr) {
-			return *m_compute_fast_cache[set + i].pipeline;
+		auto* p = m_compute_fast_cache[set + i].pipeline.load(std::memory_order_acquire);
+		if (p != nullptr && m_compute_fast_cache[set + i].id.load(std::memory_order_acquire) == id) {
+			return *p;
 		}
 	}
 
@@ -1564,16 +1559,21 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto insert_fast_cache = [this, set, id](Pipeline* pipeline) {
 		for (size_t i = 0; i < COMPUTE_FAST_CACHE_WAYS; ++i) {
-			if (m_compute_fast_cache[set + i].pipeline == nullptr ||
-			    m_compute_fast_cache[set + i].id == id) {
-				m_compute_fast_cache[set + i] = {.id = id, .pipeline = pipeline};
+			const uint64_t entry_id = m_compute_fast_cache[set + i].id.load(std::memory_order_relaxed);
+			if (m_compute_fast_cache[set + i].pipeline.load(std::memory_order_relaxed) == nullptr ||
+			    entry_id == id) {
+				m_compute_fast_cache[set + i].id.store(0, std::memory_order_relaxed);
+				m_compute_fast_cache[set + i].pipeline.store(pipeline, std::memory_order_relaxed);
+				m_compute_fast_cache[set + i].id.store(id, std::memory_order_release);
 				return;
 			}
 		}
 		static std::atomic<uint32_t> victim_counter {0};
 		const size_t target_slot =
 		    set + (victim_counter.fetch_add(1, std::memory_order_relaxed) % COMPUTE_FAST_CACHE_WAYS);
-		m_compute_fast_cache[target_slot] = {.id = id, .pipeline = pipeline};
+		m_compute_fast_cache[target_slot].id.store(0, std::memory_order_relaxed);
+		m_compute_fast_cache[target_slot].pipeline.store(pipeline, std::memory_order_relaxed);
+		m_compute_fast_cache[target_slot].id.store(id, std::memory_order_release);
 	};
 
 	if (auto iter = m_compute_pipelines.find(id); iter != m_compute_pipelines.end()) {

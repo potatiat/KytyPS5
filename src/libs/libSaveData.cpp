@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 namespace Libs {
@@ -729,11 +731,24 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	const auto& dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	const auto param_file =
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / dir_name / "sce_sys" / "param.bin";
+
 	if (param_type == 0) {
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		std::ifstream in(param_file, std::ios::binary);
+		if (in.is_open()) {
+			in.read(static_cast<char*>(param_buf), sizeof(SaveDataParam));
+		}
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -760,7 +775,26 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 	     "\t buf_size    = %" PRIu64 "\n",
 	     mount_point->data, reinterpret_cast<uint64_t>(icon->buf), icon->buf_size);
 
+	Common::LockGuard lock(g_mount_mutex);
 	icon->data_size = 0;
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	const auto& dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	const auto icon_file =
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / dir_name / "sce_sys" / "icon0.png";
+
+	if (std::filesystem::exists(icon_file) && icon->buf != nullptr && icon->buf_size > 0) {
+		std::ifstream in(icon_file, std::ios::binary | std::ios::ate);
+		if (in.is_open()) {
+			const auto file_size = static_cast<size_t>(in.tellg());
+			in.seekg(0, std::ios::beg);
+			const auto to_read = (std::min)(file_size, icon->buf_size);
+			in.read(static_cast<char*>(icon->buf), to_read);
+			icon->data_size = file_size;
+		}
+	}
 
 	return OK;
 }
@@ -775,6 +809,20 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 	LOGF("\t mount_point = %s\n"
 	     "\t path        = %s\n",
 	     mount_point->data, path);
+
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	const auto& dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	const auto sce_sys_dir =
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / dir_name / "sce_sys";
+	std::filesystem::create_directories(sce_sys_dir);
+	const auto icon_file = sce_sys_dir / "icon0.png";
+
+	std::error_code ec;
+	std::filesystem::copy_file(path, icon_file, std::filesystem::copy_options::overwrite_existing, ec);
 
 	return OK;
 }
@@ -848,7 +896,17 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     "\t param_buf_size = %" PRIu64 "\n",
 	     mount_point->data, param_type, param_buf_size);
 
-	if (param_type == 0) {
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	const auto& dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	const auto sce_sys_dir =
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / dir_name / "sce_sys";
+	std::filesystem::create_directories(sce_sys_dir);
+
+	if (param_type == 0 && param_buf != nullptr && param_buf_size >= sizeof(SaveDataParam)) {
 		const auto* p = static_cast<const SaveDataParam*>(param_buf);
 
 		LOGF("\t title      = %s\n"
@@ -856,6 +914,12 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+
+		const auto param_file = sce_sys_dir / "param.bin";
+		std::ofstream out(param_file, std::ios::binary);
+		if (out.is_open()) {
+			out.write(static_cast<const char*>(param_buf), sizeof(SaveDataParam));
+		}
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}

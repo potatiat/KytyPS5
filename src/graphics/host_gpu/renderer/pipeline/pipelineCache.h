@@ -249,22 +249,35 @@ private:
 	                      m_in_flight_compute;
 	Common::Mutex         m_mutex;
 	struct ComputeFastCacheEntry {
-		uint64_t  id       = 0;
-		Pipeline* pipeline = nullptr;
+		std::atomic<uint64_t>  id {0};
+		std::atomic<Pipeline*> pipeline {nullptr};
+
+		ComputeFastCacheEntry() = default;
+		ComputeFastCacheEntry(const ComputeFastCacheEntry& o)
+		    : id(o.id.load(std::memory_order_relaxed))
+		    , pipeline(o.pipeline.load(std::memory_order_relaxed)) {}
+		ComputeFastCacheEntry& operator=(const ComputeFastCacheEntry& o) {
+			pipeline.store(o.pipeline.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			id.store(o.id.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			return *this;
+		}
+	};
+	struct ThreadLocalGraphicsCache {
+		static constexpr size_t SIZE = 8;
+		struct Entry {
+			uint64_t            vs_id = 0;
+			uint64_t            ps_id = 0;
+			GraphicsPipelineKey key {};
+			Pipeline*           pipeline = nullptr;
+		};
+		std::array<Entry, SIZE> entries {};
+		size_t                  victim = 0;
 	};
 	static constexpr size_t COMPUTE_FAST_CACHE_WAYS = 4;
-	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 4096;
+	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 64;
 	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = COMPUTE_FAST_CACHE_SETS * COMPUTE_FAST_CACHE_WAYS;
 	std::array<ComputeFastCacheEntry, COMPUTE_FAST_CACHE_SIZE> m_compute_fast_cache {};
 
-	struct GraphicsMruEntry {
-		uint64_t            vs_id    = 0;
-		uint64_t            ps_id    = 0;
-		GraphicsPipelineKey key {};
-		Pipeline*           pipeline = nullptr;
-	};
-	static constexpr size_t GRAPHICS_MRU_SIZE = 64;
-	std::array<GraphicsMruEntry, GRAPHICS_MRU_SIZE> m_graphics_mru {};
 	std::atomic<uint32_t> m_new_pipelines_since_save {0};
 
 	std::unordered_map<uint64_t, ManifestComputeRecord> m_manifest_records;
