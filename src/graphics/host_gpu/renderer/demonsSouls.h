@@ -5,7 +5,19 @@
 
 namespace Libs::Graphics {
 class BufferCache;
+struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
+
+[[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            ShaderBufferResource& resolved_descriptor,
+                                            uint32_t& resolved_clear, uint64_t& resolved_size);
+
+[[nodiscard]] bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                             ShaderBufferResource& resolved_descriptor,
+                                             uint32_t& resolved_clear, uint64_t& resolved_size);
+
 namespace DemonsSouls {
 // Compatibility policy for the title/version whose explicit compute boundaries
 // and periodic-copy kernel have been checked. Unknown versions use the emulator.
@@ -15,5 +27,7 @@ constexpr bool IsSupportedVersion(std::string_view title, std::string_view versi
 bool IsSupportedGame();
 bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
                    uint32_t z, uint32_t mode);
+bool TryBufferClear(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
+                    uint32_t z, uint32_t mode);
 } // namespace DemonsSouls
 } // namespace Libs::Graphics

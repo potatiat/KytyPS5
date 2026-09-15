@@ -55,10 +55,6 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
-static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
-                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
-                                      ShaderBufferResource& resolved_descriptor,
-                                      uint32_t& resolved_clear, uint64_t& resolved_size);
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer& buffer, uint32_t group_x,
@@ -149,10 +145,10 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
-static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
-                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
-                                      ShaderBufferResource& resolved_descriptor,
-                                      uint32_t& resolved_clear, uint64_t& resolved_size) {
+bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                               uint32_t group_y, uint32_t group_z, uint32_t mode,
+                               ShaderBufferResource& resolved_descriptor,
+                               uint32_t& resolved_clear, uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	const auto& user_data = resources.user_data;
@@ -348,6 +344,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
 	if (indirect_args == 0 && DemonsSouls::TryLinearCopy(input_info, m_context.GetBufferCache(),
+	        thread_group_x, thread_group_y, thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
+	if (indirect_args == 0 && DemonsSouls::TryBufferClear(input_info, m_context.GetBufferCache(),
 	        thread_group_x, thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;

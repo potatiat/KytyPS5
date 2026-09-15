@@ -69,4 +69,29 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 	cache.CopyBuffer(dst, src, bytes, false, false);
 	return true;
 }
+
+bool TryBufferClear(const ShaderComputeInputInfo& input, BufferCache& cache, uint32_t x, uint32_t y,
+                    uint32_t z, uint32_t mode) {
+	if (!IsSupportedGame()) {
+		return false;
+	}
+	ShaderBufferResource resolved_descriptor;
+	uint32_t             resolved_clear = 0;
+	uint64_t             resolved_size  = 0;
+	if (!ResolveComputeBufferFill(input, x, y, z, mode, resolved_descriptor, resolved_clear,
+	                              resolved_size) &&
+	    !ResolveComputePatternFill(input, x, y, z, mode, resolved_descriptor, resolved_clear,
+	                               resolved_size)) {
+		return false;
+	}
+	const auto vaddr = resolved_descriptor.Base48();
+	if (vaddr == 0 || (vaddr & 3u) != 0 || (resolved_size & 3u) != 0 || resolved_size == 0) {
+		return false;
+	}
+	if (!LibKernel::Memory::IsUniqueGuestBackingRange(vaddr, resolved_size)) {
+		return false;
+	}
+	cache.FillBuffer(vaddr, resolved_size, resolved_clear, false);
+	return true;
+}
 } // namespace Libs::Graphics::DemonsSouls

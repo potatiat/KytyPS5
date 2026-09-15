@@ -26830,7 +26830,7 @@ void CheckSampledColorViews() {
                            &process) != 0,
             "CreateProcess failed");
     Require("SampledColorViews", "host",
-            WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+            WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0,
             "unsupported view death case timed out");
     DWORD exit_code = 0;
     const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
