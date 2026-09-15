@@ -583,17 +583,18 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (file->directory) {
 		std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
+		if (!file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
 		const auto        bytes = ReadDirectory(file, buf, nbytes);
 		LOGF("\tRead %" PRIu64 " directory bytes from: %s\n", bytes,
 		     Common::PathToString(file->real_name).c_str());
@@ -611,20 +612,26 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 
 	std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
 
-	bool       is_invalid = file->f.IsInvalid();
-	const auto pos        = file->f.Tell();
-	const auto file_size  = file->f.Size();
-	const auto remaining  = pos < file_size ? file_size - pos : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	bool     is_invalid = file->f.IsInvalid();
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	if (!is_invalid) {
+		file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+		is_invalid = file->f.IsInvalid();
+	}
 
 	lock.unlock();
 
 	if (is_invalid) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
+	}
+
+	if (bytes_read > 0) {
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes_read);
 	}
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
@@ -643,12 +650,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		auto*      out      = (d == 1 ? stdout : stderr);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
 		const auto flush_ok = std::fflush(out) == 0;
-
-		if (written != nbytes || !flush_ok) {
-			return KERNEL_ERROR_EIO;
-		}
-
-		return static_cast<int64_t>(written);
+		return (written == nbytes && flush_ok ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO);
 	}
 
 	if (d < DESCRIPTOR_MIN) {
@@ -662,27 +664,32 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
-	EXIT_IF(!file->opened);
-
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
 	std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
 
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
 	bool     is_invalid    = file->f.IsInvalid();
 	uint32_t bytes_written = 0;
-	if (file->append) {
-		file->f.Seek(file->f.Size());
-	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	if (file->sync_writes) {
-		file->f.Flush();
+	if (!is_invalid) {
+		if (file->append) {
+			file->f.Seek(file->f.Size());
+		}
+		file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+		if (file->sync_writes) {
+			file->f.Flush();
+		}
+		is_invalid = file->f.IsInvalid();
 	}
 
 	lock.unlock();
@@ -714,13 +721,11 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
-
-	EXIT_IF(!file->opened);
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
@@ -737,9 +742,13 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	bool     is_invalid = false;
 	{
 		std::shared_lock<std::shared_mutex> lock(file->rw_mutex);
+		if (!file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
 		is_invalid = file->f.IsInvalid();
 		if (!is_invalid) {
 			file->f.ReadAt(buf, static_cast<uint32_t>(nbytes), static_cast<uint64_t>(offset), &bytes_read);
+			is_invalid = file->f.IsInvalid();
 		}
 	}
 
@@ -775,28 +784,33 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
-	EXIT_IF(!file->opened);
-
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
 	std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
 
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
 	bool     is_invalid    = file->f.IsInvalid();
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
-	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	if (file->sync_writes) {
-		file->f.Flush();
+	if (!is_invalid) {
+		file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+		file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+		if (file->sync_writes) {
+			file->f.Flush();
+		}
+		file->f.Seek(pos);
+		is_invalid = file->f.IsInvalid();
 	}
-	file->f.Seek(pos);
 
 	lock.unlock();
 
@@ -820,17 +834,19 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (file->special != SpecialFile::None) {
 		return KERNEL_ERROR_ESPIPE;
 	}
 
 	std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
+
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
 
 	if (!file->directory && file->f.IsInvalid()) {
 		LOGF("\tfile is invalid\n");
@@ -937,11 +953,9 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	auto file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -966,6 +980,10 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	if (!file->directory) {
 		std::shared_lock<std::shared_mutex> lock(file->rw_mutex);
+
+		if (!file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
 
 		bool is_invalid = file->f.IsInvalid();
 		auto size       = file->f.Size();
@@ -1115,7 +1133,7 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 
 	auto file = g_files->GetFile(fd);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1123,8 +1141,10 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_IF(!file->opened);
 	std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
+	if (!file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
 	if (file->dents_offset > file->dirents.size() || file->dents_offset % DIR_BLOCK_SIZE != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}

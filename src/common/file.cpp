@@ -85,7 +85,7 @@ File::File(const std::filesystem::path& name, Mode mode): m_p(std::make_unique<F
 }
 
 bool File::IsInvalid() const {
-	return m_p->f == nullptr;
+	return m_p->f == nullptr || SysFileIsError(*m_p->f);
 }
 
 bool File::Create(const std::filesystem::path& name) {

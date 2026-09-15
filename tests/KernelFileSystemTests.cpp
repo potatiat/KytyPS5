@@ -12,7 +12,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <array>
-
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -365,6 +366,114 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+void CheckPreadConcurrent(const std::filesystem::path &root) {
+  constexpr size_t FileSize = 65536;
+  std::vector<char> pattern(FileSize);
+  for (size_t i = 0; i < FileSize; ++i) {
+    pattern[i] = static_cast<char>((i * 73 + 19) & 0xff);
+  }
+
+  Common::File fixture;
+  Check(fixture.Create(root / "pread_test.bin"), "create pread test fixture");
+  fixture.Write(pattern.data(), static_cast<uint32_t>(pattern.size()));
+  fixture.Close();
+
+  FileSystem::Mount(root, "/app0");
+
+  // Test 1: read-only descriptor (overlapped handle on Windows)
+  const int fd = FileSystem::KernelOpen("/app0/pread_test.bin", 0, 0);
+  Check(fd >= 3, "open pread fixture");
+
+  // Initial position check
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 0, "initial position is 0");
+
+  // Positional read at offset 0
+  std::vector<char> buf(1024);
+  Check(FileSystem::KernelPread(fd, buf.data(), buf.size(), 0) == static_cast<int64_t>(buf.size()),
+        "pread from offset 0");
+  Check(std::memcmp(buf.data(), pattern.data(), buf.size()) == 0,
+        "pread data at offset 0 matches pattern");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 0, "pread preserved offset at 0");
+
+  // Positional read at offset 12345
+  std::vector<char> buf2(500);
+  Check(FileSystem::KernelPread(fd, buf2.data(), buf2.size(), 12345) == static_cast<int64_t>(buf2.size()),
+        "pread from offset 12345");
+  Check(std::memcmp(buf2.data(), pattern.data() + 12345, buf2.size()) == 0,
+        "pread data at offset 12345 matches pattern");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 0, "pread preserved offset at 0 after non-zero pread");
+
+  // Seek descriptor to 100, then pread at 4000
+  Check(FileSystem::KernelLseek(fd, 100, 0) == 100, "seek to offset 100");
+  std::vector<char> buf3(200);
+  Check(FileSystem::KernelPread(fd, buf3.data(), buf3.size(), 4000) == static_cast<int64_t>(buf3.size()),
+        "pread from offset 4000 with file offset at 100");
+  Check(std::memcmp(buf3.data(), pattern.data() + 4000, buf3.size()) == 0,
+        "pread data at offset 4000 matches pattern");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 100, "file offset remains at 100 after pread");
+
+  // Test EOF and beyond EOF
+  std::vector<char> eof_buf(64);
+  Check(FileSystem::KernelPread(fd, eof_buf.data(), eof_buf.size(), FileSize) == 0,
+        "pread at EOF returns 0");
+  Check(FileSystem::KernelPread(fd, eof_buf.data(), eof_buf.size(), FileSize + 1024) == 0,
+        "pread beyond EOF returns 0");
+
+  // Test negative offset returns EINVAL
+  Check(FileSystem::KernelPread(fd, eof_buf.data(), eof_buf.size(), -1) ==
+            Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "pread with negative offset returns EINVAL");
+
+  // Multi-threaded concurrent pread test
+  constexpr int NumThreads = 8;
+  constexpr int IterationsPerThread = 100;
+  std::vector<std::thread> workers;
+  workers.reserve(NumThreads);
+  std::atomic<bool> threads_ok{true};
+
+  for (int t = 0; t < NumThreads; ++t) {
+    workers.emplace_back([&, t]() {
+      std::vector<char> local_buf(256);
+      for (int iter = 0; iter < IterationsPerThread; ++iter) {
+        const int64_t off = static_cast<int64_t>(((t * 31 + iter * 127) % (FileSize - local_buf.size())));
+        const auto read_bytes = FileSystem::KernelPread(fd, local_buf.data(), local_buf.size(), off);
+        if (read_bytes != static_cast<int64_t>(local_buf.size()) ||
+            std::memcmp(local_buf.data(), pattern.data() + off, local_buf.size()) != 0) {
+          threads_ok = false;
+          break;
+        }
+      }
+    });
+  }
+
+  for (auto &w : workers) {
+    w.join();
+  }
+  Check(threads_ok.load(), "concurrent multi-threaded pread operations read correct data without corruption");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 100, "file offset remains 100 after concurrent pread");
+
+  Check(FileSystem::KernelClose(fd) == OK, "close pread fixture descriptor");
+
+  // Test pread on closed descriptor returns EBADF
+  Check(FileSystem::KernelPread(fd, buf.data(), buf.size(), 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "pread on closed descriptor returns EBADF");
+
+  // Test 2: read-write descriptor (synchronous handle on Windows)
+  const int fd_rw = FileSystem::KernelOpen("/app0/pread_test.bin", 2, 0); // O_RDWR
+  Check(fd_rw >= 3, "open pread fixture O_RDWR");
+  Check(FileSystem::KernelLseek(fd_rw, 50, 0) == 50, "seek rw descriptor to 50");
+  Check(FileSystem::KernelPread(fd_rw, buf2.data(), buf2.size(), 8000) == static_cast<int64_t>(buf2.size()),
+        "pread on rw descriptor");
+  Check(std::memcmp(buf2.data(), pattern.data() + 8000, buf2.size()) == 0,
+        "pread on rw descriptor matches pattern");
+  Check(FileSystem::KernelLseek(fd_rw, 0, 1) == 50,
+        "pread on rw descriptor preserved file offset at 50");
+  Check(FileSystem::KernelClose(fd_rw) == OK, "close rw descriptor");
+
+  FileSystem::Umount("/app0");
+}
+
 } // namespace
 
 int main() {
@@ -390,6 +499,7 @@ int main() {
   CheckMountRoot(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
+  CheckPreadConcurrent(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

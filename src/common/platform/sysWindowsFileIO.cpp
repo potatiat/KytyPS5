@@ -70,10 +70,25 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
 		if (f.is_overlapped) {
+			struct OverlappedEvent {
+				HANDLE event = nullptr;
+				OverlappedEvent() {
+					event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+				}
+				~OverlappedEvent() {
+					if (event != nullptr) {
+						CloseHandle(event);
+					}
+				}
+			};
+			thread_local OverlappedEvent t_event;
+			ResetEvent(t_event.event);
+
 			OVERLAPPED ov {};
 			uint64_t   current_pos = f.pos.load();
 			ov.Offset     = static_cast<DWORD>(current_pos & 0xffffffffu);
 			ov.OffsetHigh = static_cast<DWORD>((current_pos >> 32) & 0xffffffffu);
+			ov.hEvent     = t_event.event;
 			if (ReadFile(f.handle, data, size, &w, &ov)) {
 				f.pos += w;
 				if (bytes_read != nullptr) {
@@ -93,6 +108,7 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 						}
 					}
 				} else {
+					// ERROR_HANDLE_EOF or error produces 0 bytes read
 					if (bytes_read != nullptr) {
 						*bytes_read = 0;
 					}
@@ -112,7 +128,9 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 				s = l;
 			}
 		}
-		std::memcpy(data, f.buf->ptr, s);
+		if (s > 0) {
+			std::memcpy(data, f.buf->ptr, s);
+		}
 		f.buf->ptr += s;
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
@@ -127,7 +145,9 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 		} else {
 			s = 0;
 		}
-		std::memcpy(data, f.buf->ptr, s);
+		if (s > 0) {
+			std::memcpy(data, f.buf->ptr, s);
+		}
 		f.buf->ptr += s;
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
@@ -137,9 +157,51 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 
 void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
+		if (!f.is_overlapped) {
+			LARGE_INTEGER zero {};
+			LARGE_INTEGER saved_pos {};
+			if (SetFilePointerEx(f.handle, zero, &saved_pos, FILE_CURRENT) == 0) {
+				if (bytes_read != nullptr) {
+					*bytes_read = 0;
+				}
+				return;
+			}
+			LARGE_INTEGER target {};
+			target.QuadPart = static_cast<LONGLONG>(offset);
+			if (SetFilePointerEx(f.handle, target, nullptr, FILE_BEGIN) == 0) {
+				SetFilePointerEx(f.handle, saved_pos, nullptr, FILE_BEGIN);
+				if (bytes_read != nullptr) {
+					*bytes_read = 0;
+				}
+				return;
+			}
+			DWORD w = 0;
+			ReadFile(f.handle, data, size, &w, nullptr);
+			SetFilePointerEx(f.handle, saved_pos, nullptr, FILE_BEGIN);
+			if (bytes_read != nullptr) {
+				*bytes_read = w;
+			}
+			return;
+		}
+
+		struct OverlappedEvent {
+			HANDLE event = nullptr;
+			OverlappedEvent() {
+				event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			}
+			~OverlappedEvent() {
+				if (event != nullptr) {
+					CloseHandle(event);
+				}
+			}
+		};
+		thread_local OverlappedEvent t_event;
+		ResetEvent(t_event.event);
+
 		OVERLAPPED ov {};
 		ov.Offset     = static_cast<DWORD>(offset & 0xffffffffu);
 		ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xffffffffu);
+		ov.hEvent     = t_event.event;
 		DWORD w = 0;
 		if (ReadFile(f.handle, data, size, &w, &ov)) {
 			if (bytes_read != nullptr) {
@@ -158,6 +220,7 @@ void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, ui
 					}
 				}
 			} else {
+				// ERROR_HANDLE_EOF or other error produces 0 bytes read
 				if (bytes_read != nullptr) {
 					*bytes_read = 0;
 				}
@@ -167,7 +230,9 @@ void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, ui
 		uint32_t s = 0;
 		if (offset < f.buf->size) {
 			s = std::min<uint32_t>(size, static_cast<uint32_t>(f.buf->size - offset));
-			std::memcpy(data, f.buf->base + offset, s);
+			if (s > 0) {
+				std::memcpy(data, f.buf->base + offset, s);
+			}
 		}
 		if (bytes_read != nullptr) {
 			*bytes_read = s;

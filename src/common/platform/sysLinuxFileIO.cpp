@@ -133,7 +133,9 @@ void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, ui
 		uint32_t s = 0;
 		if (offset < f.buf->size) {
 			s = std::min<uint32_t>(size, static_cast<uint32_t>(f.buf->size - offset));
-			std::memcpy(data, f.buf->base + offset, s);
+			if (s > 0) {
+				std::memcpy(data, f.buf->base + offset, s);
+			}
 		}
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
