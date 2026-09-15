@@ -741,7 +741,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	uint32_t bytes_read = 0;
 	bool     is_invalid = false;
 	{
-		std::shared_lock<std::shared_mutex> lock(file->rw_mutex);
+		std::unique_lock<std::shared_mutex> lock(file->rw_mutex);
 		if (!file->opened) {
 			return KERNEL_ERROR_EBADF;
 		}

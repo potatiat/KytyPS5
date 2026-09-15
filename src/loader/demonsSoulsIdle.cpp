@@ -10,8 +10,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <immintrin.h>
-#include <thread>
 
 namespace Loader::DemonsSoulsIdle {
 namespace {
@@ -20,10 +18,7 @@ uint64_t               cave = 0, site = 0;
 std::array<uint8_t, 5> installed_call {};
 
 void KYTY_SYSV_ABI WaitForWork() {
-	for (int i = 0; i < 64; ++i) {
-		_mm_pause();
-	}
-	std::this_thread::yield();
+	Common::Thread::SleepMicroWithoutSpinning(50);
 }
 } // namespace
 
@@ -83,7 +78,7 @@ void Install(Program* program) {
 	}
 	cave = allocated;
 	site = call;
-	LOGF("Demon's Souls idle wait: installed user-mode adaptive backoff\n");
+	LOGF("Demon's Souls idle wait: installed portable 50 us backoff\n");
 #endif
 }
 

@@ -305,13 +305,13 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_
 	auto   wide   = file_name.wstring();
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
-	                     GetCacheAccessType(cache_type) | FILE_FLAG_OVERLAPPED, nullptr);
+	                     GetCacheAccessType(cache_type), nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
 		ret->type = SYS_FILE_ERROR;
 	} else {
 		ret->type          = SYS_FILE_FILE;
-		ret->is_overlapped = true;
+		ret->is_overlapped = false;
 		ret->pos           = 0;
 	}
 

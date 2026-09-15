@@ -4,8 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <immintrin.h>
-#include <thread>
 
 namespace {
 void Check(bool pass, const char* text) {
@@ -13,15 +11,6 @@ void Check(bool pass, const char* text) {
 		std::fprintf(stderr, "idle wait: %s\n", text);
 		std::abort();
 	}
-}
-
-static uint32_t s_adaptive_yields = 0;
-void KYTY_SYSV_ABI TestAdaptiveBackoff() {
-	++s_adaptive_yields;
-	for (int i = 0; i < 64; ++i) {
-		_mm_pause();
-	}
-	std::this_thread::yield();
 }
 } // namespace
 
@@ -55,8 +44,6 @@ int main() {
 	code.ret();
 	const auto* thunk = code.getCurr();
 	EmitThunk(code, poll, sleep);
-	const auto* adaptive_thunk = code.getCurr();
-	EmitThunk(code, poll, reinterpret_cast<const void*>(&TestAdaptiveBackoff));
 	// SysV runner: (output, busy, target). Save host callee-saved registers,
 	// including Win64's nonvolatile XMM registers through the compiler bridge.
 	const auto* run = code.getCurr();
@@ -84,14 +71,6 @@ int main() {
 		runner(actual.data(), busy, thunk);
 		Check(expected == actual, "poll GPR and SIMD state must survive the host callback");
 		Check(waits == before + (busy == 0), "only an empty poll may wait");
-	}
-	for (uint64_t busy: {0, 1}) {
-		std::array<uint8_t, 104> expected {}, actual {};
-		runner(expected.data(), busy, poll);
-		const auto before = s_adaptive_yields;
-		runner(actual.data(), busy, adaptive_thunk);
-		Check(expected == actual, "poll GPR and SIMD state must survive the adaptive backoff callback");
-		Check(s_adaptive_yields == before + (busy == 0), "only an empty poll may trigger adaptive backoff");
 	}
 #endif
 	std::puts("Demon's Souls idle wait tests passed");
