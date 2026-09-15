@@ -624,13 +624,18 @@ struct PipelineCache::ProgramCache {
 	}
 };
 
+static std::atomic<uint64_t> s_next_pipeline_cache_instance_id {1};
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_instance_id(s_next_pipeline_cache_instance_id.fetch_add(1, std::memory_order_relaxed)),
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
 
 PipelineCache::~PipelineCache() {
+	m_instance_id = 0;
 	m_compiler_pool.WaitIdle();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
@@ -1464,9 +1469,19 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
 				const auto index = buffer.attr_indices[attribute];
 				EXIT_IF(index < 0 || index >= vs_input_info.resources_num);
+				uint32_t   attr_size     = 4;
+				const auto registers_num = vs_input_info.resources_dst[index].registers_num;
+				const auto compiled_components =
+				    vs_input_info.stage.program->info.vertex_fetch_components[index];
+				const auto used_components =
+				    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
+				vk::Format format = vk::Format::eUndefined;
+				GetInputFormat(vs_input_info.resources[index], format, attr_size,
+				               static_cast<uint32_t>(used_components));
 				key.vertex_input.attributes[index] = {
 				    .offset  = buffer.attr_offsets[attribute],
 				    .binding = static_cast<uint8_t>(binding),
+				    .format  = format,
 				};
 			}
 		}
@@ -1478,7 +1493,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 
 	for (size_t i = 0; i < ThreadLocalGraphicsCache::SIZE; i++) {
 		auto& entry = tl_graphics_cache.entries[i];
-		if (entry.vs_id == vs_id && entry.ps_id == ps_id && entry.pipeline != nullptr) {
+		if (entry.owner == this && entry.instance_id == m_instance_id &&
+		    entry.vs_id == vs_id && entry.ps_id == ps_id && entry.pipeline != nullptr) {
 			if (entry.key == key) {
 				return *entry.pipeline;
 			}
@@ -1491,10 +1507,12 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		auto* res = iter->second.get();
 		auto& slot = tl_graphics_cache.entries[tl_graphics_cache.victim++ % ThreadLocalGraphicsCache::SIZE];
 		slot = {
-		    .vs_id    = vs_id,
-		    .ps_id    = ps_id,
-		    .key      = iter->first,
-		    .pipeline = res,
+		    .owner       = this,
+		    .instance_id = m_instance_id,
+		    .vs_id       = vs_id,
+		    .ps_id       = ps_id,
+		    .key         = iter->first,
+		    .pipeline    = res,
 		};
 		return *res;
 	}
@@ -1525,10 +1543,12 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	auto* res = iter->second.get();
 	auto& slot = tl_graphics_cache.entries[tl_graphics_cache.victim++ % ThreadLocalGraphicsCache::SIZE];
 	slot = {
-	    .vs_id    = vs_id,
-	    .ps_id    = ps_id,
-	    .key      = iter->first,
-	    .pipeline = res,
+	    .owner       = this,
+	    .instance_id = m_instance_id,
+	    .vs_id       = vs_id,
+	    .ps_id       = ps_id,
+	    .key         = iter->first,
+	    .pipeline    = res,
 	};
 
 	m_new_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);

@@ -92,9 +92,10 @@ struct PipelineVertexInputState {
 		bool     operator==(const Binding&) const = default;
 	};
 	struct Attribute {
-		uint32_t offset                             = 0;
-		uint8_t  binding                            = 0;
-		bool     operator==(const Attribute&) const = default;
+		uint32_t   offset                             = 0;
+		uint8_t    binding                            = 0;
+		vk::Format format                             = vk::Format::eUndefined;
+		bool       operator==(const Attribute&) const = default;
 	};
 
 	std::array<Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
@@ -231,6 +232,7 @@ private:
 			for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
 				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
 				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
+				PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.vertex_input.attributes[i].format));
 			}
 			PipelineKeyHash::MixStaticParams(hash, key.static_params);
 			return hash;
@@ -238,6 +240,7 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	uint64_t                      m_instance_id = 0;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
@@ -265,10 +268,12 @@ private:
 	struct ThreadLocalGraphicsCache {
 		static constexpr size_t SIZE = 8;
 		struct Entry {
-			uint64_t            vs_id = 0;
-			uint64_t            ps_id = 0;
-			GraphicsPipelineKey key {};
-			Pipeline*           pipeline = nullptr;
+			const PipelineCache* owner       = nullptr;
+			uint64_t             instance_id = 0;
+			uint64_t             vs_id       = 0;
+			uint64_t             ps_id       = 0;
+			GraphicsPipelineKey  key {};
+			Pipeline*            pipeline    = nullptr;
 		};
 		std::array<Entry, SIZE> entries {};
 		size_t                  victim = 0;
@@ -312,6 +317,8 @@ void CreateComputePipelineDirect(
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
+                    uint32_t used_components);
 
 } // namespace Libs::Graphics
 

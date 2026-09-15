@@ -89,8 +89,8 @@ static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_
 	return false;
 }
 
-static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
-                           uint32_t used_components) {
+void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
+                    uint32_t used_components) {
 	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
 	if (raw_format == kTemporaryVertexAttribFormat113) {

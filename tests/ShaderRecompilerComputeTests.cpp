@@ -917,6 +917,7 @@ std::string VulkanResultName(vk::Result result) {
                        const std::string &message) {
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
                shader_name, stage, message.c_str());
+  std::fflush(stderr);
   std::abort();
 }
 
@@ -12577,6 +12578,13 @@ OpFunctionEnd
     constexpr uint64_t allocation_size = 0x20000;
     EnsureRuntimeContext();
     if (lod_subgroup && !m_runtime_context.fragment_subgroup_reduction) return;
+    if (packed_vertex_color) {
+      const auto props = m_physical_device.getFormatProperties(vk::Format::eB10G11R11UfloatPack32);
+      if (!(props.bufferFeatures & vk::FormatFeatureFlagBits::eVertexBuffer)) {
+        std::printf("[gpu]     %-32s skipped (unsupported vertex format)\n", name);
+        return;
+      }
+    }
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -12764,8 +12772,8 @@ OpFunctionEnd
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};
-      const vk::Rect2D scissor{{0, 0}, {extent, extent}};
       cmd.setViewportWithCount(1, &viewport);
+      const vk::Rect2D scissor{{0, 0}, {extent, extent}};
       cmd.setScissorWithCount(1, &scissor);
       cmd.setLineWidth(1);
       cmd.setDepthTestEnable(depth.depth_test_enable);
