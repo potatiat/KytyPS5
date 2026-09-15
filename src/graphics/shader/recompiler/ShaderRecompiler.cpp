@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <map>
 #include <span>
+#include <spirv-tools/optimizer.hpp>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -716,6 +717,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+
+	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+	optimizer.RegisterPerformancePasses();
+	std::vector<uint32_t> optimized_spirv;
+	if (optimizer.Run(spirv.data(), spirv.size(), &optimized_spirv)) {
+		spirv = std::move(optimized_spirv);
+	}
+
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

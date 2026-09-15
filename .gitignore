@@ -2,6 +2,8 @@
 .vs/
 .idea/
 build/
+build*/
+.build*
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
