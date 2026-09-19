@@ -283,8 +283,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
-	r.depth_min_bounds         = hw.GetDepthBoundsMin();
-	r.depth_max_bounds         = hw.GetDepthBoundsMax();
+	float min_b                = hw.GetDepthBoundsMin();
+	float max_b                = hw.GetDepthBoundsMax();
+	if (std::isnan(min_b)) {
+		min_b = 0.0f;
+	}
+	if (std::isnan(max_b)) {
+		max_b = 1.0f;
+	}
+	r.depth_min_bounds = std::clamp(std::min(min_b, max_b), 0.0f, 1.0f);
+	r.depth_max_bounds = std::clamp(std::max(min_b, max_b), 0.0f, 1.0f);
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;

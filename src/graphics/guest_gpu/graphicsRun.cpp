@@ -1643,11 +1643,13 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			const uint64_t     begin_count  = m_synthetic_occlusion_counter & counter_mask;
+			const uint64_t     end_count    = (begin_count + 1024u) & counter_mask;
 			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+				results[db * 2u]     = ready_bit | begin_count;
+				results[db * 2u + 1] = ready_bit | end_count;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			m_synthetic_occlusion_counter = (end_count + 1u) & counter_mask;
 			break;
 		}
 		default:

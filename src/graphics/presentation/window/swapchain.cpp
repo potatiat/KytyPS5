@@ -30,6 +30,7 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage image;
 	uint64_t    present_tick = 0;
+	uint64_t    ready_tick   = 0;
 	bool        busy         = false;
 	bool        reusing_last = false;
 
@@ -149,6 +150,7 @@ public:
 		}
 		frame->busy         = false;
 		frame->reusing_last = false;
+		frame->ready_tick   = 0;
 		if (make_last) {
 			m_last_frame = frame;
 		}
@@ -157,7 +159,12 @@ public:
 	}
 
 private:
-	void WaitForFrame(Presenter::Frame& frame) { m_scheduler.Wait(frame.present_tick); }
+	void WaitForFrame(Presenter::Frame& frame) {
+		m_scheduler.Wait(frame.present_tick);
+		if (frame.ready_tick != 0 && m_window.render_context != nullptr) {
+			m_window.render_context->GetCommandScheduler().Wait(frame.ready_tick);
+		}
+	}
 
 	WindowContext&                                 m_window;
 	CommandScheduler&                              m_scheduler;
@@ -286,7 +293,8 @@ public:
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
 	                                           bool draw_system_overlay);
-	uint64_t             Submit(CommandScheduler& scheduler);
+	uint64_t             Submit(CommandScheduler& scheduler, vk::Semaphore wait_semaphore = nullptr,
+	                            uint64_t wait_tick = 0);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -658,10 +666,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	}
 }
 
-uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler, vk::Semaphore wait_semaphore,
+                           uint64_t wait_tick) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	if (wait_semaphore != nullptr && wait_tick != 0) {
+		submit.AddWait(wait_semaphore, wait_tick, vk::PipelineStageFlagBits::eTransfer);
+	}
 	submit.AddSignal(m_render_complete[m_image_index]);
 	return scheduler.Submit(submit);
 }
@@ -722,6 +734,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->ready_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
 	return *frame;
 }
 
@@ -737,10 +750,12 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	if (producer != nullptr) {
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
+		frame->ready_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
 	} else {
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
+		frame->ready_tick   = 0;
 	}
 	return *frame;
 }
@@ -781,7 +796,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
-			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			const auto wait_sem = frame.ready_tick != 0
+			                          ? m_impl->renderer.GetCommandScheduler().GetMasterSemaphore().Handle()
+			                          : vk::Semaphore {};
+			frame.present_tick =
+			    swapchain.Submit(m_impl->present_scheduler, wait_sem, frame.ready_tick);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
