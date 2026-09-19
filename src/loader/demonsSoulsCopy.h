@@ -12,10 +12,13 @@ namespace DemonsSoulsCopy {
 void Install(Program* program);
 void Clear();
 using PrepareWrite = bool (*)(uint64_t, uint64_t);
+
+constexpr size_t CoherentThreshold = 256 * 1024;
+
 inline void* Move(void* destination, const void* source, size_t size, PrepareWrite prepare) {
 	if (size == 0 || destination == source) return destination;
 	// Preserve the normal mapping/fault path after preparing a complete large write.
-	if (size >= 256 * 1024 && prepare) (void)prepare(reinterpret_cast<uint64_t>(destination), size);
+	if (size >= CoherentThreshold && prepare) (void)prepare(reinterpret_cast<uint64_t>(destination), size);
 	return std::memmove(destination, source, size);
 }
 inline std::array<uint8_t, 13> Tailcall(uint64_t function) {

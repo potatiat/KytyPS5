@@ -1011,9 +1011,15 @@ static int ConvertMessageFlags(int flags) {
 	if ((flags & guest_msg_dontroute) != 0) {
 		host_flags |= MSG_DONTROUTE;
 	}
+#if defined(_WIN32)
+	if ((flags & guest_msg_waitall) != 0 && (flags & guest_msg_peek) == 0) {
+		host_flags |= MSG_WAITALL;
+	}
+#else
 	if ((flags & guest_msg_waitall) != 0) {
 		host_flags |= MSG_WAITALL;
 	}
+#endif
 #if !defined(_WIN32)
 	if ((flags & guest_msg_dontwait) != 0) {
 		host_flags |= MSG_DONTWAIT;
