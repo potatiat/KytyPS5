@@ -74,6 +74,7 @@ public:
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
 	void       Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	void       ReadAt(void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read = nullptr);
 	ByteBuffer Read(uint32_t size);
 	void       Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 	void       Write(const ByteBuffer& buf, uint32_t* bytes_written = nullptr);

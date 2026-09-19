@@ -13,6 +13,8 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <vector>
 
@@ -33,11 +35,13 @@ struct sys_file_mem_buf_t {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_t {
-	sys_file_type_t type;
+	sys_file_type_t type = SYS_FILE_ERROR;
 	union {
 		HANDLE              handle;
 		sys_file_mem_buf_t* buf;
 	};
+	bool                  is_overlapped = false;
+	std::atomic<uint64_t> pos {0};
 };
 
 // IWYU pragma: no_include <fileapi.h>
@@ -65,9 +69,56 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
-		if (bytes_read != nullptr) {
-			*bytes_read = w;
+		if (f.is_overlapped) {
+			struct OverlappedEvent {
+				HANDLE event = nullptr;
+				OverlappedEvent() {
+					event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+				}
+				~OverlappedEvent() {
+					if (event != nullptr) {
+						CloseHandle(event);
+					}
+				}
+			};
+			thread_local OverlappedEvent t_event;
+			ResetEvent(t_event.event);
+
+			OVERLAPPED ov {};
+			uint64_t   current_pos = f.pos.load();
+			ov.Offset     = static_cast<DWORD>(current_pos & 0xffffffffu);
+			ov.OffsetHigh = static_cast<DWORD>((current_pos >> 32) & 0xffffffffu);
+			ov.hEvent     = t_event.event;
+			if (ReadFile(f.handle, data, size, &w, &ov)) {
+				f.pos += w;
+				if (bytes_read != nullptr) {
+					*bytes_read = w;
+				}
+			} else {
+				DWORD err = GetLastError();
+				if (err == ERROR_IO_PENDING) {
+					if (GetOverlappedResult(f.handle, &ov, &w, TRUE)) {
+						f.pos += w;
+						if (bytes_read != nullptr) {
+							*bytes_read = w;
+						}
+					} else {
+						if (bytes_read != nullptr) {
+							*bytes_read = 0;
+						}
+					}
+				} else {
+					// ERROR_HANDLE_EOF or error produces 0 bytes read
+					if (bytes_read != nullptr) {
+						*bytes_read = 0;
+					}
+				}
+			}
+		} else {
+			ReadFile(f.handle, data, size, &w, nullptr);
+			if (bytes_read != nullptr) {
+				*bytes_read = w;
+			}
 		}
 	} else if (f.type == SYS_FILE_MEMORY_STAT) {
 		uint32_t s = size;
@@ -77,7 +128,9 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 				s = l;
 			}
 		}
-		std::memcpy(data, f.buf->ptr, s);
+		if (s > 0) {
+			std::memcpy(data, f.buf->ptr, s);
+		}
 		f.buf->ptr += s;
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
@@ -92,10 +145,101 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 		} else {
 			s = 0;
 		}
-		std::memcpy(data, f.buf->ptr, s);
+		if (s > 0) {
+			std::memcpy(data, f.buf->ptr, s);
+		}
 		f.buf->ptr += s;
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
+		}
+	}
+}
+
+void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, uint32_t* bytes_read) {
+	if (f.type == SYS_FILE_FILE) {
+		if (!f.is_overlapped) {
+			LARGE_INTEGER zero {};
+			LARGE_INTEGER saved_pos {};
+			if (SetFilePointerEx(f.handle, zero, &saved_pos, FILE_CURRENT) == 0) {
+				if (bytes_read != nullptr) {
+					*bytes_read = 0;
+				}
+				return;
+			}
+			LARGE_INTEGER target {};
+			target.QuadPart = static_cast<LONGLONG>(offset);
+			if (SetFilePointerEx(f.handle, target, nullptr, FILE_BEGIN) == 0) {
+				SetFilePointerEx(f.handle, saved_pos, nullptr, FILE_BEGIN);
+				if (bytes_read != nullptr) {
+					*bytes_read = 0;
+				}
+				return;
+			}
+			DWORD w = 0;
+			ReadFile(f.handle, data, size, &w, nullptr);
+			SetFilePointerEx(f.handle, saved_pos, nullptr, FILE_BEGIN);
+			if (bytes_read != nullptr) {
+				*bytes_read = w;
+			}
+			return;
+		}
+
+		struct OverlappedEvent {
+			HANDLE event = nullptr;
+			OverlappedEvent() {
+				event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			}
+			~OverlappedEvent() {
+				if (event != nullptr) {
+					CloseHandle(event);
+				}
+			}
+		};
+		thread_local OverlappedEvent t_event;
+		ResetEvent(t_event.event);
+
+		OVERLAPPED ov {};
+		ov.Offset     = static_cast<DWORD>(offset & 0xffffffffu);
+		ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xffffffffu);
+		ov.hEvent     = t_event.event;
+		DWORD w = 0;
+		if (ReadFile(f.handle, data, size, &w, &ov)) {
+			if (bytes_read != nullptr) {
+				*bytes_read = w;
+			}
+		} else {
+			DWORD err = GetLastError();
+			if (err == ERROR_IO_PENDING) {
+				if (GetOverlappedResult(f.handle, &ov, &w, TRUE)) {
+					if (bytes_read != nullptr) {
+						*bytes_read = w;
+					}
+				} else {
+					if (bytes_read != nullptr) {
+						*bytes_read = 0;
+					}
+				}
+			} else {
+				// ERROR_HANDLE_EOF or other error produces 0 bytes read
+				if (bytes_read != nullptr) {
+					*bytes_read = 0;
+				}
+			}
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		uint32_t s = 0;
+		if (offset < f.buf->size) {
+			s = std::min<uint32_t>(size, static_cast<uint32_t>(f.buf->size - offset));
+			if (s > 0) {
+				std::memcpy(data, f.buf->base + offset, s);
+			}
+		}
+		if (bytes_read != nullptr) {
+			*bytes_read = s;
+		}
+	} else {
+		if (bytes_read != nullptr) {
+			*bytes_read = 0;
 		}
 	}
 }
@@ -166,7 +310,9 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_
 	if (h_file == INVALID_HANDLE_VALUE) {
 		ret->type = SYS_FILE_ERROR;
 	} else {
-		ret->type = SYS_FILE_FILE;
+		ret->type          = SYS_FILE_FILE;
+		ret->is_overlapped = false;
+		ret->pos           = 0;
 	}
 
 	ret->handle = h_file;
@@ -315,6 +461,10 @@ bool SysFileUnlink(sys_file_t& f, const std::filesystem::path& name) {
 bool SysFileSeek(sys_file_t& f, uint64_t offset) {
 	bool ok = true;
 	if (f.type == SYS_FILE_FILE) {
+		if (f.is_overlapped) {
+			f.pos = offset;
+			return true;
+		}
 		LARGE_INTEGER s;
 		s.QuadPart = static_cast<LONGLONG>(offset);
 		ok         = (SetFilePointerEx(f.handle, s, nullptr, FILE_BEGIN) != 0);
@@ -328,6 +478,9 @@ bool SysFileSeek(sys_file_t& f, uint64_t offset) {
 
 uint64_t SysFileTell(sys_file_t& f) {
 	if (f.type == SYS_FILE_FILE) {
+		if (f.is_overlapped) {
+			return f.pos.load();
+		}
 		LARGE_INTEGER s {};
 		LARGE_INTEGER r {};
 		s.QuadPart = 0;

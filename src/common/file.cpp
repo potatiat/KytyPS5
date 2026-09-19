@@ -85,7 +85,7 @@ File::File(const std::filesystem::path& name, Mode mode): m_p(std::make_unique<F
 }
 
 bool File::IsInvalid() const {
-	return m_p->f == nullptr;
+	return m_p->f == nullptr || SysFileIsError(*m_p->f);
 }
 
 bool File::Create(const std::filesystem::path& name) {
@@ -209,6 +209,14 @@ void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 
 	if (m_p->f != nullptr) {
 		SysFileRead(data, size, *m_p->f, bytes_read);
+	}
+}
+
+void File::ReadAt(void* data, uint32_t size, uint64_t offset, uint32_t* bytes_read) {
+	EXIT_IF(m_p->f == nullptr);
+
+	if (m_p->f != nullptr) {
+		SysFileReadAt(data, size, offset, *m_p->f, bytes_read);
 	}
 }
 

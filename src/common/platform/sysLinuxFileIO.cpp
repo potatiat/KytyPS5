@@ -9,8 +9,10 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -113,6 +115,34 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 		f.buf->ptr += s;
 		if (bytes_read != nullptr) {
 			*bytes_read = s;
+		}
+	}
+}
+
+void SysFileReadAt(void* data, uint32_t size, uint64_t offset, sys_file_t& f, uint32_t* bytes_read) {
+	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
+#if defined(__APPLE__)
+		ssize_t ret = pread(fileno(f.f), data, size, static_cast<off_t>(offset));
+#else
+		ssize_t ret = pread64(fileno(f.f), data, size, static_cast<off64_t>(offset));
+#endif
+		if (bytes_read != nullptr) {
+			*bytes_read = (ret > 0) ? static_cast<uint32_t>(ret) : 0;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		uint32_t s = 0;
+		if (offset < f.buf->size) {
+			s = std::min<uint32_t>(size, static_cast<uint32_t>(f.buf->size - offset));
+			if (s > 0) {
+				std::memcpy(data, f.buf->base + offset, s);
+			}
+		}
+		if (bytes_read != nullptr) {
+			*bytes_read = s;
+		}
+	} else {
+		if (bytes_read != nullptr) {
+			*bytes_read = 0;
 		}
 	}
 }
