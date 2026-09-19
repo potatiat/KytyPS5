@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -34,7 +35,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
-	bool                                      mesh_shader_enabled                   = false;
+	bool                               index_type_uint8_enabled              = false;
+	bool                               mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -107,6 +109,7 @@ struct GraphicContext {
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
+	std::function<void()> on_out_of_memory;
 
 private:
 	mutable std::mutex                                 m_format_properties_mutex;

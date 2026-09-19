@@ -54,6 +54,16 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	[[nodiscard]] Image*        TryGetImage(ImageId id) noexcept {
+		auto* image = m_slot_images.try_get(id);
+		if (image != nullptr) {
+			TouchImage(*image);
+		}
+		return image;
+	}
+	[[nodiscard]] const Image*  TryGetImage(ImageId id) const noexcept {
+		return m_slot_images.try_get(id);
+	}
 	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -74,7 +84,7 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	void RunGarbageCollector(bool force = false);
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -104,6 +114,7 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
@@ -168,7 +179,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::unordered_map<uint64_t, ImageId>             m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

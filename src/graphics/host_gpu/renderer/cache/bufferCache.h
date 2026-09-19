@@ -80,7 +80,7 @@ public:
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
 	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
 
-	void               RunGarbageCollector();
+	void               RunGarbageCollector(bool force = false);
 
 private:
 	friend struct BufferCacheTestAccess;

@@ -322,6 +322,13 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	if (image.image_type == vk::ImageType::e1D &&
+	    (normalized.type == vk::ImageViewType::e2D ||
+	     normalized.type == vk::ImageViewType::e2DArray)) {
+		normalized.type = normalized.type == vk::ImageViewType::e2DArray
+		                      ? vk::ImageViewType::e1DArray
+		                      : vk::ImageViewType::e1D;
+	}
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
 	const bool slice_view =

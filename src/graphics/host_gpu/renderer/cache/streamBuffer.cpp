@@ -84,9 +84,27 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
+	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
+	if (result != vk::Result::eSuccess && graphics.on_out_of_memory) {
+		graphics.on_out_of_memory();
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess && (allocation_info.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT)) {
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess) {
+		allocation_info.preferredFlags = 0;
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -190,7 +208,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	}
 	const auto native = command.Handle();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
+	                       vk::DependencyFlags {}, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
 	const vk::BufferMemoryBarrier after[] = {
@@ -202,7 +220,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		after_stage |= vk::PipelineStageFlagBits::eHost;
 	}
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	                       vk::DependencyFlags {}, 0, nullptr, 2, after, 0, nullptr);
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
@@ -216,14 +234,14 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	            vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {},
 	                       0, nullptr, 1, &before, 0, nullptr);
 	native.fillBuffer(Handle(), offset, size, value);
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	                       vk::DependencyFlags {}, 0, nullptr, 1, &after, 0, nullptr);
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,

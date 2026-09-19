@@ -50,6 +50,17 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		uint64_t current_val = 0;
+		(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &current_val);
+		std::fprintf(stderr, "\n[CRITICAL GPU ERROR] MasterSemaphore::Wait FAILED!\n"
+		                     "  result = %d (%s)\n"
+		                     "  waiting for tick = %" PRIu64 "\n"
+		                     "  current GPU counter = %" PRIu64 "\n\n",
+		             static_cast<int>(result), vk::to_string(result).c_str(),
+		             tick, current_val);
+		std::fflush(stderr);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

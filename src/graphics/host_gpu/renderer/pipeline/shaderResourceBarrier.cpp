@@ -34,7 +34,8 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
-	                        vk::AccessFlagBits::eColorAttachmentWrite;
+	                        vk::AccessFlagBits::eColorAttachmentWrite |
+	                        vk::AccessFlagBits::eIndirectCommandRead;
 	return barrier;
 }
 
@@ -88,8 +89,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages,
+                         bool writes_memory) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
+	if (!writes_memory) {
+		vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 0, nullptr);
+		return;
+	}
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);

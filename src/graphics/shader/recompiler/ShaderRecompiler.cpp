@@ -716,6 +716,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

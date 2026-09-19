@@ -1251,7 +1251,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			for (const auto& item : emit.direct_run)
 				vk_buffer.drawIndexed(item.indexCount, item.instanceCount, item.firstIndex,
 				                      item.vertexOffset, item.firstInstance);
-		} else EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		}
 	}
 
 	if (set_auto_debug) {

@@ -62,6 +62,31 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceFeatures WindowContext::RequiredVulkan10Features() noexcept {
+	vk::PhysicalDeviceFeatures features {};
+	features.multiDrawIndirect        = VK_TRUE;
+	features.fragmentStoresAndAtomics = VK_TRUE;
+	features.samplerAnisotropy        = VK_TRUE;
+	features.robustBufferAccess       = VK_TRUE;
+#if !defined(__APPLE__)
+	features.depthBounds = VK_TRUE; // unsupported by MoltenVK
+#endif
+	features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	features.shaderImageGatherExtended            = VK_TRUE;
+	features.independentBlend                     = VK_TRUE;
+	features.tessellationShader                   = VK_TRUE;
+	features.sampleRateShading                    = VK_TRUE;
+	features.depthBiasClamp                       = VK_TRUE;
+	features.shaderClipDistance                   = VK_TRUE;
+	features.shaderCullDistance                   = VK_TRUE;
+	features.largePoints                          = VK_TRUE;
+	features.multiViewport                        = VK_TRUE;
+	features.fillModeNonSolid                     = VK_TRUE;
+	features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	features.shaderInt64                          = VK_TRUE;
+	return features;
+}
+
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
 	features.sType                     = vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -71,6 +96,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.drawIndirectCount         = VK_TRUE;
 	return features;
 }
 
@@ -294,6 +320,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.drawIndirectCount == VK_TRUE &&
+		    features12.drawIndirectCount != VK_TRUE) {
+			LOGF("drawIndirectCount is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.multiDrawIndirect != VK_TRUE) {
+			LOGF("multiDrawIndirect is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
@@ -650,7 +685,18 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool index_uint8_extension =
+	    HasExtension(device_extensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+	vk::PhysicalDeviceIndexTypeUint8FeaturesEXT supported_index_uint8 {};
+	if (index_uint8_extension) {
+		supported_index_uint8.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_index_uint8;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.index_type_uint8_enabled =
+	    index_uint8_extension && supported_index_uint8.indexTypeUint8;
+	LOGF("Vulkan index type uint8 support: %s\n",
+	     graphics.index_type_uint8_enabled ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -695,30 +741,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.drawIndirectCount == VK_TRUE &&
+	                     supported_features12.drawIndirectCount != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiDrawIndirect != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
-	vk::PhysicalDeviceFeatures device_features {};
-	device_features.fragmentStoresAndAtomics = VK_TRUE;
-	device_features.samplerAnisotropy        = VK_TRUE;
-	device_features.robustBufferAccess       = VK_TRUE;
-#if !defined(__APPLE__)
-	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
-#endif
-	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.independentBlend                     = VK_TRUE;
-	device_features.tessellationShader                   = VK_TRUE;
-	device_features.sampleRateShading                    = VK_TRUE;
-	device_features.depthBiasClamp                       = VK_TRUE;
-	device_features.shaderClipDistance                   = VK_TRUE;
-	device_features.shaderCullDistance                   = VK_TRUE;
-	device_features.largePoints                          = VK_TRUE;
-	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = VK_TRUE;
-	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
-	graphics.sample_rate_shading_enabled                 = true;
-	device_features.shaderInt64 = VK_TRUE;
+	vk::PhysicalDeviceFeatures device_features           = WindowContext::RequiredVulkan10Features();
+	graphics.sample_rate_shading_enabled                 = (device_features.sampleRateShading == VK_TRUE);
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -771,6 +801,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::PhysicalDeviceIndexTypeUint8FeaturesEXT enabled_index_uint8 {};
+	enabled_index_uint8.indexTypeUint8 = VK_TRUE;
+	if (graphics.index_type_uint8_enabled) {
+		enabled_index_uint8.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &enabled_index_uint8;
 	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
@@ -1166,7 +1202,8 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

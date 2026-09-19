@@ -5,7 +5,9 @@
 
 namespace Libs::Graphics {
 class BufferCache;
+struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
+
 namespace DemonsSouls {
 // Compatibility policy for the title/version whose explicit compute boundaries
 // and periodic-copy kernel have been checked. Unknown versions use the emulator.

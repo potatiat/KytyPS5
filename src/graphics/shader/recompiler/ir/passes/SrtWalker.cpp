@@ -862,7 +862,7 @@ private:
 				return false;
 			case ValueOpcode::UMin32:
 				if (binary()) {
-					result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+					result = (std::min)(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
 					return true;
 				}
 				return false;
@@ -1286,7 +1286,7 @@ void BuildLinearSrtPlan(ResourcePlan& program) {
 }
 
 static bool LinearMaskMatches(std::span<const uint8_t> a,std::span<const uint8_t> b) {
-    for(size_t i=0;i<std::max(a.size(),b.size());++i)
+    for(size_t i=0;i<(std::max)(a.size(),b.size());++i)
         if((i<a.size() && a[i]!=0)!=(i<b.size() && b[i]!=0))return false;
     return true;
 }

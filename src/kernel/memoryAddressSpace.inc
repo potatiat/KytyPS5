@@ -720,14 +720,45 @@ public:
 		SYSTEM_INFO info {};
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
+		MEMORYSTATUSEX mem_status {};
+		mem_status.dwLength = sizeof(mem_status);
+		if (GlobalMemoryStatusEx(&mem_status) != 0) {
+			constexpr uint64_t reserve_margin = 4096ull * 1024ull * 1024ull;
+			if (mem_status.ullAvailPageFile > reserve_margin &&
+			    backing_size > mem_status.ullAvailPageFile - reserve_margin) {
+				backing_size = (mem_status.ullAvailPageFile - reserve_margin) &
+				               ~((1024ull * 1024ull * 64ull) - 1ull);
+				if (backing_size < 1024ull * 1024ull * 1024ull) {
+					backing_size = 1024ull * 1024ull * 1024ull;
+				}
+			}
+		}
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
+			delete m_backing;
+			m_backing = nullptr;
+			for (uint64_t fallback_mb : {8192ull, 6144ull, 4096ull, 2048ull, 1024ull}) {
+				const uint64_t fallback_size = fallback_mb * 1024ull * 1024ull;
+				if (fallback_size < backing_size) {
+					m_backing = new GuestBackingStore(fallback_size);
+					if (m_backing->IsAvailable()) {
+						LOGF_COLOR(Log::Color::Yellow,
+						           "GuestAddressSpace: committed reduced backing store (%" PRIu64
+						           " MB) due to host commit limit\n", fallback_mb);
+						break;
+					}
+					delete m_backing;
+					m_backing = nullptr;
+				}
+			}
+		}
+		if (m_backing == nullptr || !m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory (win_err=0x%08x). Windows commits\n"
 			     "this up front, so the paging file is usually what needs to be larger.\n",
-			     backing_size / (1024U * 1024U));
+			     backing_size / (1024U * 1024U), static_cast<uint32_t>(GetLastError()));
 #else
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
 			     backing_size / (1024U * 1024U));
