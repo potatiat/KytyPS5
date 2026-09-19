@@ -125,7 +125,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
 				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
+				                              vk::AccessFlagBits2::eMemoryWrite |
+				                              vk::AccessFlagBits2::eColorAttachmentWrite |
+				                              vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
 				if (subresource_state.layout != destination_layout ||
@@ -157,7 +159,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	} else {
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
+		                                vk::AccessFlagBits2::eMemoryWrite |
+		                                vk::AccessFlagBits2::eColorAttachmentWrite |
+		                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
