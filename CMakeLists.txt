@@ -368,6 +368,7 @@ function(add_kyty_full_emulator_test target source)
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi)
+		target_link_options(${target} PRIVATE "/STACK:8388608")
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
@@ -413,9 +414,16 @@ target_link_libraries(demons_souls_copy_tests xbyak::xbyak)
 target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
 
 add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
-target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
+	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/demonsSoulsIdle.cpp")
+target_link_libraries(demons_souls_idle_tests fmt::fmt common xbyak::xbyak)
 target_include_directories(demons_souls_idle_tests PRIVATE ${inc_headers})
+
+add_executable(demons_souls_culling_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsCullingTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/demonsSoulsCulling.cpp")
+target_link_libraries(demons_souls_culling_tests fmt::fmt common xbyak::xbyak)
+target_include_directories(demons_souls_culling_tests PRIVATE ${inc_headers})
 
 add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
@@ -567,6 +575,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
 	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
+	add_test(NAME demons_souls_culling COMMAND $<TARGET_FILE:demons_souls_culling_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)

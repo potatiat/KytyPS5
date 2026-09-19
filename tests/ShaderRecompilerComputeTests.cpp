@@ -5060,6 +5060,42 @@ public:
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
 
+      constexpr uint64_t cross_dim_offset = 0x200000;
+      auto cross_cached = sampled;
+      cross_cached.info.data = {base + cross_dim_offset, 0x10000};
+      cross_cached.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      cross_cached.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      cross_cached.info.extent = {4, 4, 1};
+      cross_cached.info.resources = {2, 2};
+      cross_cached.info.pitch = 4;
+      cross_cached.info.bytes_per_block = 4;
+      cross_cached.info.mip_layout[0] = {0, 0x8000, 4, 4};
+      cross_cached.info.mip_layout[1] = {0x8000, 0x8000, 2, 2};
+      cross_cached.view_info.format = cross_cached.info.pixel_format;
+      cross_cached.view_info.type = vk::ImageViewType::e2DArray;
+      cross_cached.view_info.level_count = 2;
+      cross_cached.view_info.layer_count = 2;
+      const auto cross_cached_id = texture_cache.FindImage(cross_cached);
+      (void)texture_cache.FindTexture(cross_cached_id, cross_cached);
+      texture_cache.MarkGpuWritten(cross_cached_id);
+
+      auto cross_requested = cross_cached;
+      cross_requested.info.data = {base + cross_dim_offset, 0x20000};
+      cross_requested.info.resources = {1, 4};
+      cross_requested.view_info.type = vk::ImageViewType::e2DArray;
+      cross_requested.view_info.level_count = 1;
+      cross_requested.view_info.layer_count = 4;
+      const auto cross_expanded_id = texture_cache.FindImage(cross_requested);
+      const auto cross_owner = TextureCacheTestAccess::Owner(texture_cache, cross_expanded_id);
+      Require(name, "cross-dimensional equal-address expansion",
+              cross_expanded_id && cross_expanded_id != cross_cached_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache, cross_cached_id) &&
+                  cross_owner != nullptr && cross_owner->registered &&
+                  cross_owner->info.resources.levels == 2 &&
+                  cross_owner->info.resources.layers == 4 &&
+                  cross_owner->info.data.size == 0x20000,
+              "cross-dimensional array overlap was not unified into maximal subresources");
+
       ImageInfo chain = sampled.info;
       chain.data = {0x10000, 0x8000};
       chain.extent = {8, 8, 1};

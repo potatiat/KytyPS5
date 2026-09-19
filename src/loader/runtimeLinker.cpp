@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsCulling.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -1517,6 +1518,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsCulling::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	StartAllModules();
 
@@ -1542,6 +1544,7 @@ void RuntimeLinker::Clear() {
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
 	DemonsSoulsIdle::Clear();
+	DemonsSoulsCulling::Clear();
 	DemonsSoulsCopy::Clear();
 
 	for (auto* p: m_programs) {

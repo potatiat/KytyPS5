@@ -28,9 +28,51 @@ inline constexpr std::array<uint8_t, 24> PollBytes {0x55, 0x48, 0x89, 0xe5, 0x41
                                                     0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec,
                                                     0x88, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x35, 0x25};
 
+inline constexpr uint64_t JobSyncOffset = 0x835222;
+inline constexpr uint64_t JobSyncReturnOffset = 0x8351e1;
+inline constexpr std::array<uint8_t, 14> JobSyncBytes {
+    0x45, 0x84, 0xed,              // test r13b, r13b
+    0x74, 0x09,                    // jz 0x835230
+    0x45, 0x31, 0xed,              // xor r13d, r13d
+    0xeb, 0x40,                    // jmp 0x83526c
+    0x0f, 0x1f, 0x40, 0x00         // nop dword [rax], eax
+};
+
+inline constexpr uint64_t PhysicsTimestepOffset = 0x00bdda02;
+inline constexpr std::array<uint8_t, 5> PhysicsTimestepOriginalBytes {
+    0x80, 0x38, 0x01, 0x75, 0x2a
+};
+inline constexpr std::array<uint8_t, 5> PhysicsTimestepPatchedBytes {
+    0x80, 0x38, 0x01, 0xeb, 0x2a
+};
+
+inline constexpr uint64_t PhysicsCVarOffset = 0x00be45b2;
+inline constexpr std::array<uint8_t, 14> PhysicsCVarOriginalBytes {
+    0xc6, 0x05, 0x5f, 0x53, 0x3a, 0x02, 0x01,
+    0xc6, 0x05, 0xd8, 0x52, 0x3a, 0x02, 0x01
+};
+inline constexpr std::array<uint8_t, 14> PhysicsCVarPatchedBytes {
+    0xc6, 0x05, 0x5f, 0x53, 0x3a, 0x02, 0x00,
+    0xc6, 0x05, 0xd8, 0x52, 0x3a, 0x02, 0x00
+};
+
 inline bool Matches(std::span<const uint8_t> call, std::span<const uint8_t> poll) {
 	return std::ranges::equal(call, CallBytes) && std::ranges::equal(poll, PollBytes);
 }
+
+inline bool MatchesJobSync(std::span<const uint8_t> bytes) {
+	return std::ranges::equal(bytes, JobSyncBytes);
+}
+
+inline bool MatchesPhysicsTimestep(std::span<const uint8_t> bytes) {
+	return std::ranges::equal(bytes, PhysicsTimestepOriginalBytes);
+}
+
+inline bool MatchesPhysicsCVar(std::span<const uint8_t> bytes) {
+	return std::ranges::equal(bytes, PhysicsCVarOriginalBytes);
+}
+
+void KYTY_SYSV_ABI WaitForJobSync(uint64_t sync_ptr, uint64_t expected_val, uint32_t op, uint32_t can_sleep);
 
 #if defined(__x86_64__) || defined(_M_X64)
 // The poll's observable register state is retained even on the idle path.
@@ -61,6 +103,8 @@ inline void EmitThunk(Xbyak::CodeGenerator& c, const void* poll, const void* sle
 	c.L(done);
 	c.ret();
 }
+
+void EmitJobSyncThunk(Xbyak::CodeGenerator& c, const void* native_wait, const void* return_site);
 #endif
 } // namespace DemonsSoulsIdle
 } // namespace Loader

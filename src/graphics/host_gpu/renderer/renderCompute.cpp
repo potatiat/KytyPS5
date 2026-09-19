@@ -99,6 +99,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
 				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
 				          : cache.ClearMeta(descriptor.Base48())) {
+					InvalidateRenderTargetCache();
 					return true;
 				}
 			}
@@ -255,6 +256,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		vk::ClearValue clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, range, clear);
+		InvalidateRenderTargetCache();
 		return true;
 	}
 	ShaderBufferResource descriptor;
@@ -283,6 +285,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 	}
+	InvalidateRenderTargetCache();
 	return true;
 }
 
@@ -363,61 +366,63 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	const auto sampled_images = std::count_if(
-	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-	    });
-	const bool                   has_sampler = !program.info.samplers.empty();
-	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
-		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
-		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
-		     program.bindings.UsesPushData()
-		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
-		         : 0u);
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& buffer = program.info.buffers[i];
-			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
-			     " stride=%u records=%u format=%u\n",
-			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
-			     r.Stride(), r.NumRecords(), r.RawFormat());
-		}
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			const auto& image = program.info.images[i];
-			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
-			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
-			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
-			     i, image.source, image.written ? "read-write" : "read-only",
-			     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
-			         ? "true"
-			         : "false",
-			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
-			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
-			     static_cast<uint32_t>(r.Depth()) + 1u,
-			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
-			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
-			         ? 1u
-			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
-			     static_cast<uint32_t>(r.TileMode()));
-		}
-		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i]);
-			LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
-			     "lod=%u-%u bias=%d\n",
-			     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
-			     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
-			     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
-			     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
-			     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
-			     static_cast<int32_t>(r.LodBias()));
+	if (Config::GraphicsDebugDumpEnabled()) {
+		const auto sampled_images = std::count_if(
+		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		    });
+		const bool                   has_sampler = !program.info.samplers.empty();
+		static std::atomic<uint32_t> dispatch_log_count {0};
+		if ((large_workgroup || has_sampler) &&
+		    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+			LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+			     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+			     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
+			     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
+			     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
+			     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
+			     sampled_images, program.info.images.size() - sampled_images,
+			     program.info.samplers.size(),
+			     program.bindings.UsesPushData()
+			         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
+			         : 0u);
+			for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+				const auto& buffer = program.info.buffers[i];
+				const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
+				     " stride=%u records=%u format=%u\n",
+				     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
+				     r.Stride(), r.NumRecords(), r.RawFormat());
+			}
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				const auto& image = program.info.images[i];
+				const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
+				     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
+				     i, image.source, image.written ? "read-write" : "read-only",
+				     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
+				         ? "true"
+				         : "false",
+				     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
+				     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				     static_cast<uint32_t>(r.Depth()) + 1u,
+				     r.Type() == Prospero::ImageType::kColor2DMsaa ||
+				             r.Type() == Prospero::ImageType::kColor2DMsaaArray
+				         ? 1u
+				         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
+				     static_cast<uint32_t>(r.TileMode()));
+			}
+			for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+				const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i]);
+				LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
+				     "lod=%u-%u bias=%d\n",
+				     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
+				     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
+				     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
+				     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
+				     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
+				     static_cast<int32_t>(r.LodBias()));
+			}
 		}
 	}
 
@@ -469,16 +474,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
-	FindBuffers(bindings);
-	PrepareBdaBindings(bindings);
+	auto prepared = PrepareBindings(input_info.stage);
+	FindBuffers(prepared);
+	PrepareBdaBindings(prepared);
 	// Materialize the persistent argument owner before final descriptor handles:
 	// a tiny CPU upload must not leave an indirect command using a stream slice
 	// that can be retired when preparation rotates the command buffer.
 	if (indirect_args != 0)
 		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
-	RebindBuffers(bindings);
-	RebindImages(bindings);
+	RebindBuffers(prepared);
+	RebindImages(prepared);
 
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t indirect_offset = 0;
@@ -491,7 +496,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const bool chain = DemonsSouls::IsSupportedGame();
 	auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
-	PreparedBindings* descriptor_stage = &bindings;
+	PreparedBindings* descriptor_stage = &prepared;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	const bool continues_chain = chain && buffer.ComputeChainPending();
@@ -509,7 +514,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (m_bound_compute_pipeline != pipeline.pipeline || m_bound_pipeline_cmd_buffer != vk_buffer) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		m_bound_compute_pipeline    = pipeline.pipeline;
+		m_bound_pipeline_cmd_buffer = vk_buffer;
+	}
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;

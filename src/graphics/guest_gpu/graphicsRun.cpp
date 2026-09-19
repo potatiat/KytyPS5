@@ -264,6 +264,7 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 
 void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+	GetScheduler().PopPendingOperations();
 }
 
 void CommandProcessor::BufferFlush() {
@@ -963,6 +964,7 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	m_draw_run_skip = 0;
 	return count * 5u;
 }
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);

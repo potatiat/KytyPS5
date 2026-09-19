@@ -199,11 +199,11 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer = m_lod_stats_buffer.Handle();
-	barrier.size = 256 * 16;
+	barrier.buffer              = m_lod_stats_buffer.Handle();
+	barrier.size                = 256 * 16;
 	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
 	m_scheduler.Finish();
@@ -380,15 +380,18 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
+			const auto leap_size =
+			    std::min<uint64_t>(std::max<uint64_t>(StreamLeapSize, buffer_end - buffer_begin),
+			                       16ull * 1024ull * 1024ull);
 			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
-				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
+				end += std::min(leap_size, PageTable::kAddressSpaceSize - end);
 			}
 			if (expands_right) {
 				const auto minimum = CACHING_PAGESIZE * 2;
 				if (begin > minimum) {
-					begin -= std::min(StreamLeapSize, begin - minimum);
+					begin -= std::min(leap_size, begin - minimum);
 				}
 				first = find_first(begin);
 				begin = std::min(begin, first->first);

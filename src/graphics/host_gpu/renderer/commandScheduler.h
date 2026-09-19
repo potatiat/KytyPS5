@@ -95,6 +95,7 @@ private:
 	CommandBuffer                m_command;
 	uint32_t m_recorded_dispatches = 0;
 	std::queue<PendingOperation> m_pending_operations;
+	std::atomic<uint32_t>        m_pending_operations_count {0};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;

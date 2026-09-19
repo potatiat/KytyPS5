@@ -183,12 +183,18 @@ void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
 	constexpr int64_t GiB = 1024ll * 1024 * 1024;
 	const auto budget = static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
 	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-	m_pressure_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-	m_critical_gc_memory = static_cast<uint64_t>(
-	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-	// Keep reusable images resident until memory is actually under pressure.
-	m_trigger_gc_memory = m_pressure_gc_memory;
+	if (budget <= 8 * GiB) {
+		m_pressure_gc_memory = std::min<uint64_t>(budget - GiB, 5ULL * GiB);
+		m_critical_gc_memory = std::min<uint64_t>(budget - GiB / 2, 6ULL * GiB);
+		m_trigger_gc_memory = m_pressure_gc_memory;
+	} else {
+		m_pressure_gc_memory = static_cast<uint64_t>(
+		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+		m_critical_gc_memory = static_cast<uint64_t>(
+		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+		// Keep reusable images resident until memory is actually under pressure.
+		m_trigger_gc_memory = m_pressure_gc_memory;
+	}
 	if (const auto* legacy = std::getenv("KYTY_TEXTURE_CACHE_EARLY_GC");
 	    legacy != nullptr && std::strcmp(legacy, "1") == 0) {
 		m_trigger_gc_memory =
@@ -287,6 +293,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -312,6 +319,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -953,18 +961,35 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		if (requested.type == cached.info.type && requested.resources > cached.info.resources) {
-			return {ExpandImage(requested, cached_id)};
+		if (requested.type == cached.info.type &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+			auto expanded_info             = requested;
+			expanded_info.resources.levels = std::max(requested.resources.levels, cached.info.resources.levels);
+			expanded_info.resources.layers = std::max(requested.resources.layers, cached.info.resources.layers);
+			expanded_info.extent.width     = std::max(requested.extent.width, cached.info.extent.width);
+			expanded_info.extent.height    = std::max(requested.extent.height, cached.info.extent.height);
+			expanded_info.extent.depth     = std::max(requested.extent.depth, cached.info.extent.depth);
+			expanded_info.data.size        = std::max(requested.data.size, cached.info.data.size);
+			if (cached.info.resources.levels > requested.resources.levels) {
+				expanded_info.mip_layout = cached.info.mip_layout;
+			}
+			return {ExpandImage(expanded_info, cached_id)};
 		}
-		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
-		     " requested=%ux%u "
-		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
-		     requested.data.address, requested.resources.levels, requested.resources.layers,
-		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
-		     cached.info.data.size, static_cast<uint32_t>(requested.type),
-		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		if (safe_to_delete) {
+			FreeImage(cached_id);
+			return {merged_id};
+		}
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "TextureCache: unresolvable equal-address image overlap, replacing cached image: address=0x%016" PRIx64
+		           " requested=%ux%u cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
+		           " type=%u/%u tile=%u/%u\n",
+		           requested.data.address, requested.resources.levels, requested.resources.layers,
+		           cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
+		           cached.info.data.size, static_cast<uint32_t>(requested.type),
+		           static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
+		           static_cast<uint32_t>(cached.info.tile_mode));
+		FreeImage(cached_id);
+		return {merged_id};
 	}
 
 	if (requested.data.address > cached.info.data.address) {
@@ -1840,6 +1865,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
@@ -1848,6 +1874,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
@@ -2021,7 +2048,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		return false;
 	}
 	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
@@ -2072,6 +2099,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		image.MarkBufferModified();
 	}
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
@@ -2263,6 +2291,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 		DeleteImage(id);
 	}
+	m_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void TextureCache::RunGarbageCollector(bool force) {
@@ -2277,7 +2306,7 @@ void TextureCache::RunGarbageCollector(bool force) {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = force || m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = (force || allow_aggressive) && (force || m_total_used_memory >= m_critical_gc_memory);
-		const uint64_t age       = force ? 0 : std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t age       = force ? 0 : std::min<uint64_t>(aggressive ? 0 : (pressured ? 80 : 16), tick);
 		size_t         deletions = force ? 128 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2294,6 +2323,9 @@ void TextureCache::RunGarbageCollector(bool force) {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (!force && owner->tick_accessed_last >= m_scheduler.CurrentTick()) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {

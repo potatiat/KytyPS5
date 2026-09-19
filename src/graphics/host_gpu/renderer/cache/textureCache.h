@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -85,6 +86,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector(bool force = false);
+	[[nodiscard]] uint64_t Epoch() const noexcept { return m_epoch.load(std::memory_order_acquire); }
+	void InvalidateCache() noexcept { m_epoch.fetch_add(1, std::memory_order_release); }
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -189,6 +192,7 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	std::atomic<uint64_t> m_epoch             {1};
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

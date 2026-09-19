@@ -389,6 +389,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());
+	InvalidateRenderTargetCache();
 	return true;
 }
 

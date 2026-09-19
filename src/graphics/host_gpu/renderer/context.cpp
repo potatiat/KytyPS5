@@ -51,6 +51,8 @@ vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
 }
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_context.GetRenderExecutor().InvalidateRenderTargetCache();
+	m_context.GetRenderExecutor().InvalidateBufferBindings();
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};

@@ -279,7 +279,7 @@ private:
 		size_t                  victim = 0;
 	};
 	static constexpr size_t COMPUTE_FAST_CACHE_WAYS = 4;
-	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 64;
+	static constexpr size_t COMPUTE_FAST_CACHE_SETS = 1024;
 	static constexpr size_t COMPUTE_FAST_CACHE_SIZE = COMPUTE_FAST_CACHE_SETS * COMPUTE_FAST_CACHE_WAYS;
 	std::array<ComputeFastCacheEntry, COMPUTE_FAST_CACHE_SIZE> m_compute_fast_cache {};
 

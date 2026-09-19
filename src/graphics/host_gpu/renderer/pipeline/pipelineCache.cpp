@@ -1034,6 +1034,15 @@ void PipelineCache::SaveManifestLocked() {
 }
 
 void PipelineCache::PreloadPipelines() {
+#if defined(_WIN32)
+	if (GetModuleHandleA("Nvda.Graphics.Interception.dll") != nullptr ||
+	    GetModuleHandleA("WarpVizTarget.dll") != nullptr ||
+	    std::getenv("KYTY_DISABLE_PRELOAD_PIPELINES") != nullptr) {
+		PipelineCacheLog("Vulkan pipeline cache: profiler/debugger detected; skipping startup preload to avoid stalls");
+		return;
+	}
+#endif
+
 	if (m_manifest_path.empty() || !Common::File::IsFileExisting(m_manifest_path)) {
 		return;
 	}

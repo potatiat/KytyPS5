@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -26,8 +29,6 @@ class Shader;
 struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
-struct RenderDepthInfo;
-struct RenderColorInfo;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
@@ -72,6 +73,20 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+};
+
+struct PreparedVertexBuffers {
+	static constexpr uint32_t MaxBuffers = 32;
+
+	std::array<vk::Buffer, MaxBuffers>     buffers {};
+	std::array<vk::DeviceSize, MaxBuffers> offsets {};
+	uint32_t                               count = 0;
+};
+
+struct PreparedIndexBuffer {
+	vk::Buffer     buffer = nullptr;
+	vk::DeviceSize offset = 0;
+	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
 struct SubmitInfo {
@@ -178,7 +193,84 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
 
+	void InvalidateRenderTargetCache() noexcept {
+		m_cached_render_targets.valid = false;
+	}
+
+	void InvalidateBufferBindings() noexcept {
+		m_bound_vertex_buffers      = {};
+		m_bound_index_buffer        = {};
+		m_bound_dynamic_state       = {};
+		m_bound_graphics_pipeline   = nullptr;
+		m_bound_compute_pipeline    = nullptr;
+		m_bound_pipeline_cmd_buffer = nullptr;
+	}
+
 private:
+	struct CachedRenderTargetState {
+		bool                                                       valid                      = false;
+		uint32_t                                                   render_target_slice_offset = 0;
+		uint32_t                                                   render_target_mask         = 0;
+		std::array<HW::RenderTarget, RENDER_COLOR_ATTACHMENTS_MAX> render_targets {};
+		HW::DepthRenderTarget                                      depth_target {};
+		HW::DepthControl                                           depth_control {};
+		HW::RenderControl                                          render_control {};
+		HW::StencilControl                                         stencil_control {};
+		HW::StencilMask                                            stencil_mask {};
+		HW::ColorControl                                           color_control {};
+		float                                                      depth_clear_value   = 0.0f;
+		float                                                      depth_bounds_min    = 0.0f;
+		float                                                      depth_bounds_max    = 0.0f;
+		uint8_t                                                    stencil_clear_value = 0;
+		uint64_t                                                   texture_cache_epoch = 0;
+
+		std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX>  color_info {};
+		uint32_t                                                   color_count = 0;
+		RenderDepthInfo                                            depth_info {};
+	};
+
+	struct BoundVertexBuffers {
+		vk::CommandBuffer                                             command_buffer = nullptr;
+		std::array<vk::Buffer, PreparedVertexBuffers::MaxBuffers>     buffers {};
+		std::array<vk::DeviceSize, PreparedVertexBuffers::MaxBuffers> offsets {};
+		uint32_t                                                      count = 0;
+	};
+
+	struct BoundIndexBuffer {
+		vk::CommandBuffer command_buffer = nullptr;
+		vk::Buffer        buffer         = nullptr;
+		vk::DeviceSize    offset         = 0;
+		vk::IndexType     type           = vk::IndexType::eUint16;
+	};
+
+	struct BoundDynamicState {
+		vk::CommandBuffer            command_buffer       = nullptr;
+		uint32_t                     viewport_count       = 0;
+		std::array<vk::Viewport, 16> viewports            = {};
+		std::array<vk::Rect2D, 16>   scissors             = {};
+		float                        line_width           = 1.0f;
+		std::array<float, 4>         blend_constants      = {};
+		bool                         depth_test_enable    = false;
+		bool                         depth_write_enable   = false;
+		vk::CompareOp                depth_compare_op     = vk::CompareOp::eNever;
+		bool                         depth_bias_enable    = false;
+		float                        depth_bias_constant  = 0.0f;
+		float                        depth_bias_clamp     = 0.0f;
+		float                        depth_bias_slope     = 0.0f;
+		bool                         stencil_test_enable  = false;
+		PipelineStencilDynamicState  stencil_dynamic_front {};
+		PipelineStencilDynamicState  stencil_dynamic_back  {};
+		uint32_t                     color_write_count    = 0;
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enable {};
+	};
+
+	void CommitVertexBuffers(vk::CommandBuffer vk_buffer, const PreparedVertexBuffers& prepared);
+	void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared);
+	void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+	                              const ShaderVertexInputInfo& vs_input_info,
+	                              const RenderColorInfo* colors, uint32_t color_count,
+	                              const RenderDepthInfo& depth);
+
 	bool TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer, std::span<const DrawIndexArgs> draws,
 	                     std::span<const uint64_t> argument_addresses);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -210,7 +302,12 @@ private:
 	                         bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
-	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
+	                                               const PreparedBindings* pixel = nullptr);
+	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
+	                                               uint32_t color_count, RenderDepthInfo& depth,
+	                                               const std::optional<PreparedBindings>& pixel) {
+		return AcquireRenderTargets(buffer, colors, color_count, depth, pixel ? &*pixel : nullptr);
+	}
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
@@ -233,6 +330,13 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
+	CachedRenderTargetState               m_cached_render_targets;
+	BoundVertexBuffers                    m_bound_vertex_buffers;
+	BoundIndexBuffer                      m_bound_index_buffer;
+	BoundDynamicState                     m_bound_dynamic_state;
+	vk::Pipeline                          m_bound_graphics_pipeline   = nullptr;
+	vk::Pipeline                          m_bound_compute_pipeline    = nullptr;
+	vk::CommandBuffer                     m_bound_pipeline_cmd_buffer = nullptr;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
